@@ -234,8 +234,48 @@ export async function submitHandler(req: any, res: any) {
 
         await markSubmitted(responseId);
         let computed = null;
+        let byMpn: Record<string, any> | null = null;
         try {
-            computed = await computePcfFields(responseId);
+            // Multi-MPN: compute each component separately so submit response
+            // is not one mixed total. Admin "Start PCF Calculation" also uses
+            // per-MPN compute when writing bom_emission_* rows.
+            const mpnRows = await withClient(async (client: any) => {
+                const r = await client.query(
+                    `SELECT DISTINCT product_id_or_mpn AS mpn
+                       FROM sq_q8_bom
+                      WHERE response_id = $1
+                        AND product_id_or_mpn IS NOT NULL
+                        AND TRIM(product_id_or_mpn) <> ''`,
+                    [responseId],
+                );
+                return r.rows.map((row: any) => String(row.mpn).trim()).filter(Boolean);
+            });
+            // Dedupe by root MPN (IP00231 — x vs IP00231)
+            const seen = new Set<string>();
+            const mpns: string[] = [];
+            for (const m of mpnRows) {
+                const root = m.split(/\s*[—–-]/)[0].trim();
+                if (seen.has(root)) continue;
+                seen.add(root);
+                mpns.push(root);
+            }
+
+            if (mpns.length >= 2) {
+                byMpn = {};
+                const primary = String(loaded.productIdUrn ?? "").trim();
+                const primaryRoot = primary.split(/\s*[—–-]/)[0].trim();
+                const persistMpn =
+                    (primaryRoot && mpns.includes(primaryRoot) && primaryRoot) || mpns[0];
+                for (const mpn of mpns) {
+                    byMpn[mpn] = await computePcfFields(responseId, {
+                        mpn,
+                        persist: mpn === persistMpn,
+                    });
+                }
+                computed = byMpn[persistMpn] || byMpn[mpns[0]] || null;
+            } else {
+                computed = await computePcfFields(responseId);
+            }
         } catch (computeErr: any) {
             console.error(
                 "[questionnaire/submit] formula engine error (submission still saved):",
@@ -245,7 +285,13 @@ export async function submitHandler(req: any, res: any) {
 
         return res
             .status(200)
-            .send(generateResponse(true, "submitted", 200, { responseId, computed }));
+            .send(
+                generateResponse(true, "submitted", 200, {
+                    responseId,
+                    computed,
+                    ...(byMpn ? { byMpn } : {}),
+                }),
+            );
     } catch (error: any) {
         console.error("[questionnaire/submit] error:", error);
         return res.status(500).send(generateResponse(false, error?.message ?? "submit failed", 500, null));
