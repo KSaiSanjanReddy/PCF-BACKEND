@@ -226,6 +226,120 @@ function q10bUnitsForMpnStrict(data: SupplierData, mpn?: string | null): number 
     return hit ? num(hit.units_produced) : 0;
 }
 
+/** Normalize MPN / material_number labels ("IP00231 — Panel" → root match). */
+export function mpnMatches(a?: string | null, b?: string | null): boolean {
+    const left = String(a ?? "").trim();
+    const right = String(b ?? "").trim();
+    if (!left || !right) return false;
+    if (left === right) return true;
+    const leftRoot = left.split(/\s*[—–-]/)[0].trim();
+    const rightRoot = right.split(/\s*[—–-]/)[0].trim();
+    return (
+        leftRoot === rightRoot ||
+        left.startsWith(rightRoot) ||
+        right.startsWith(leftRoot)
+    );
+}
+
+/** Pick the MPN-ish field from a child row (column names differ by question). */
+function rowMpn(row: any): string {
+    return String(
+        row?.mpn ??
+            row?.product_id_or_mpn ??
+            row?.packaging_product_id_or_mpn ??
+            row?.mpn_code ??
+            "",
+    ).trim();
+}
+
+function filterRowsByMpn(rows: any[] | undefined, mpn: string, opts?: { keepUnscoped?: boolean }): any[] {
+    const list = rows ?? [];
+    return list.filter((r) => {
+        const key = rowMpn(r);
+        if (!key) return !!opts?.keepUnscoped;
+        return mpnMatches(key, mpn);
+    });
+}
+
+/**
+ * Scope supplier data to one MPN for a per-component PCF.
+ * Q10a / Q10b stay unfiltered so factory Σ weight and per-MPN unit lookups still work.
+ * Q12 (no MPN column) stays and is allocated by this component's mass share.
+ */
+function filterDataForMpn(data: SupplierData, mpn: string): SupplierData {
+    return {
+        ...data,
+        q4_sites: data.q4_sites,
+        q8_bom: filterRowsByMpn(data.q8_bom, mpn),
+        q9a_coproducts: filterRowsByMpn(data.q9a_coproducts, mpn, { keepUnscoped: true }),
+        q8b_process_consumables: filterRowsByMpn(data.q8b_process_consumables, mpn),
+        q8c_raw_material_transport: filterRowsByMpn(data.q8c_raw_material_transport, mpn),
+        q10_electricity: filterRowsByMpn(data.q10_electricity, mpn),
+        q10a_factory_weights: data.q10a_factory_weights,
+        q10b_factory_units: data.q10b_factory_units,
+        q11_fuels: filterRowsByMpn(data.q11_fuels, mpn),
+        q12_process_gases: data.q12_process_gases,
+        q13_qc_it_energy: filterRowsByMpn(data.q13_qc_it_energy, mpn, { keepUnscoped: true }),
+        q14_production_waste: filterRowsByMpn(data.q14_production_waste, mpn),
+        q14a_production_waste_transport: filterRowsByMpn(data.q14a_production_waste_transport, mpn),
+        q16_packaging_materials: filterRowsByMpn(data.q16_packaging_materials, mpn),
+        q16a_packaging_transport: filterRowsByMpn(data.q16a_packaging_transport, mpn),
+        q17_packaging_waste: filterRowsByMpn(data.q17_packaging_waste, mpn),
+        q17a_packaging_waste_transport: filterRowsByMpn(data.q17a_packaging_waste_transport, mpn),
+        q19_transport_legs: filterRowsByMpn(data.q19_transport_legs, mpn),
+        q20_biomass_feedstock: filterRowsByMpn(data.q20_biomass_feedstock, mpn, { keepUnscoped: true }),
+    };
+}
+
+/** Declared mass for one MPN from form_snapshot.q3_items, else main scalar. */
+function resolveProductMassForMpn(
+    data: SupplierData,
+    mpn?: string | null,
+    override?: number,
+): number {
+    if (override != null && Number.isFinite(override) && override > 0) return Number(override);
+    if (!mpn) return num(data.main?.product_mass_per_declared_unit);
+
+    let snap = data.main?.form_snapshot;
+    if (typeof snap === "string") {
+        try {
+            snap = JSON.parse(snap);
+        } catch {
+            snap = null;
+        }
+    }
+    const q3 = Array.isArray(snap?.product?.q3_items) ? snap.product.q3_items : [];
+    const q3Hit = q3.find(
+        (r: any) =>
+            mpnMatches(r?.material_number, mpn) ||
+            mpnMatches(r?.product_id, mpn) ||
+            mpnMatches(r?.mpn, mpn),
+    );
+    const fromQ3 = num(q3Hit?.declared_mass);
+    if (fromQ3 > 0) return fromQ3;
+
+    const items = Array.isArray(snap?.product?.items) ? snap.product.items : [];
+    // No mass on product.items — only identity. Fall through.
+
+    // Only reuse the response-level scalar when this MPN is the primary product.
+    if (mpnMatches(data.main?.product_id_urn, mpn)) {
+        return num(data.main?.product_mass_per_declared_unit);
+    }
+
+    // Last resort: do NOT steal another component's mass (that caused identical PCFs).
+    void items;
+    return 0;
+}
+
+export type ComputePcfOptions = {
+    /** When set, only this MPN's rows are included (per-component PCF). */
+    mpn?: string;
+    /** Override declared mass (kg) for this component. */
+    productMass?: number;
+    /** Persist into pcf_computed_field (default true). Set false when looping MPNs. */
+    persist?: boolean;
+};
+
 /** Σ Q10a factory weight (kg), with legacy main-field fallback. */
 function q10aFactoryWeightKg(data: SupplierData): number {
     const q10aSum = (data.q10a_factory_weights ?? []).reduce(
@@ -484,10 +598,32 @@ function dbgInputs(data: SupplierData): void {
 // Public entry point
 // ============================================================
 
-export async function computePcfFields(responseId: string): Promise<ComputedFields> {
-    const data = await loadSupplierData(responseId);
-    if (!data.main) {
+export async function computePcfFields(
+    responseId: string,
+    options: ComputePcfOptions = {},
+): Promise<ComputedFields> {
+    const raw = await loadSupplierData(responseId);
+    if (!raw.main) {
         throw new Error(`Supplier questionnaire response not found: ${responseId}`);
+    }
+
+    const mpn = String(options.mpn ?? "").trim() || undefined;
+    let data = mpn ? filterDataForMpn(raw, mpn) : raw;
+
+    // Per-component mass: never silently reuse another MPN's declared mass.
+    const resolvedMass = resolveProductMassForMpn(data, mpn, options.productMass);
+    if (resolvedMass > 0) {
+        data = {
+            ...data,
+            main: {
+                ...data.main,
+                product_mass_per_declared_unit: resolvedMass,
+            },
+        };
+    }
+
+    if (mpn) {
+        dbg(`\n══ Per-MPN PCF  mpn=${mpn}  productMass=${resolvedMass}kg  q8rows=${data.q8_bom.length} ══`);
     }
 
     // Dump every filled field before any math runs (PCF_DEBUG only).
@@ -566,7 +702,7 @@ export async function computePcfFields(responseId: string): Promise<ComputedFiel
         breakdown,
     };
 
-    dbg(`\n══════════ FINAL PCF (declared unit) ══════════`);
+    dbg(`\n══════════ FINAL PCF (declared unit)${mpn ? ` [${mpn}]` : ""} ══════════`);
     dbg(`  production  excl=${productionStage.pcfExcludingBiogenicUptake}  incl=${productionStage.pcfIncludingBiogenicUptake}`);
     dbg(`  packaging   excl=${packagingStage.pcfExcludingBiogenicUptake}  incl=${packagingStage.pcfIncludingBiogenicUptake}  (included=${packagingStage.packagingEmissionsIncluded})`);
     dbg(`  distribution excl=${distributionStage.pcfExcludingBiogenicUptake}  incl=${distributionStage.pcfIncludingBiogenicUptake}  (included=${distributionStage.distributionStageIncluded})`);
@@ -586,7 +722,14 @@ export async function computePcfFields(responseId: string): Promise<ComputedFiel
     dbg(`  TOTAL PCF  incl biogenic uptake = ${grandIncl} kgCO2e`);
     dbg(`══════════════════════════════════════════════\n`);
 
-    await persistComputedFields(responseId, computed);
+    const shouldPersist = options.persist !== false && !mpn;
+    // When scoped to an MPN, skip overwriting the response-level pcf_computed_field
+    // (admin writes per-BOM tables instead). Unscoped submit still persists.
+    if (shouldPersist) {
+        await persistComputedFields(responseId, computed);
+    } else if (options.persist === true && mpn) {
+        await persistComputedFields(responseId, computed);
+    }
     return computed;
 }
 
