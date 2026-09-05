@@ -3636,13 +3636,6 @@ ADD COLUMN IF NOT EXISTS layer4 VARCHAR(255),
 ADD COLUMN IF NOT EXISTS ef_code VARCHAR(255);
 `,
 
-        // Q6.1 / Q22.1 — total weight of ALL products produced at the factory in the
-        // reporting period. The supplier types this manually; it is the denominator
-        // for production-energy allocation (manager's formula). Previously dropped.
-        `ALTER TABLE scope_two_indirect_emissions_questions
-ADD COLUMN IF NOT EXISTS total_weight_of_all_products_produced_kg DOUBLE PRECISION;
-`,
-
         `ALTER TABLE weight_of_packaging_per_unit_product_questions
 ADD COLUMN IF NOT EXISTS layer1 VARCHAR(255),
 ADD COLUMN IF NOT EXISTS layer2 VARCHAR(255),
@@ -3715,178 +3708,758 @@ ADD COLUMN IF NOT EXISTS ef_code VARCHAR(255);
         `DROP TABLE IF EXISTS packaging_material_treatment_type_emission_factor CASCADE;`,
         `DROP TABLE IF EXISTS vehicle_type_emission_factor CASCADE;`,
 
-        // NOTE: do NOT add `DROP TABLE emission_factors` here — this migration
-        // runs on every server boot and a drop would wipe the imported BAFU
-        // CSV every restart. The ALTER COLUMN … TYPE TEXT statements below are
-        // the safety net: they fix any legacy VARCHAR-constrained columns
-        // in-place without touching the data.
+        // NOTE: this migration runs on EVERY server boot, so it uses
+        // CREATE TABLE IF NOT EXISTS and never bare-DROPs emission_factors
+        // (a drop here would wipe the imported BAFU data on every restart).
+        // To convert an EXISTING old-schema table to the new shape below, run
+        // ONCE in pgAdmin:  DROP TABLE IF EXISTS emission_factors CASCADE;
+        // then reboot - the CREATE below recreates it with the new columns.
 
+        // Columns map 1:1 to the 7 BAFU CSV columns, plus `domain` (stamped per
+        // source file), `is_legacy`, `search_text` and audit timestamps.
+        //   CSV col 1 Category          -> category
+        //   CSV col 2 Sub-category      -> sub_category
+        //   CSV col 3 Group             -> group_name   (`group` is reserved)
+        //   CSV col 4 Specific Type     -> specific_type (the EF name/dropdown label)
+        //   CSV col 5 Geography         -> geography
+        //   CSV col 6 Unit              -> unit
+        //   CSV col 7 GWP 100 [kgCO2e]  -> gwp_100
+        // NOTE: the old "Dataset Name" column was dropped — the new source file
+        // has no such column; `specific_type` is now the sole EF name and the
+        // dedup key.
         `CREATE TABLE IF NOT EXISTS emission_factors (
-            ef_id TEXT PRIMARY KEY,
-            product TEXT NOT NULL,
-            category TEXT,
-            sub_category_1 TEXT,
-            sub_category_2 TEXT,
-            country_code TEXT,
-            country_name TEXT,
-            unit TEXT,
-            kgco2e_per_unit NUMERIC(18, 6),
-            reference_year INTEGER,
-            source_db TEXT,
-            embedding_text TEXT,
-            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-            updated_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            ef_id          BIGSERIAL PRIMARY KEY,
+            domain         TEXT NOT NULL,
+            category       TEXT NOT NULL,
+            sub_category   TEXT,
+            group_name     TEXT,
+            specific_type  TEXT NOT NULL,
+            geography      TEXT NOT NULL,
+            unit           TEXT NOT NULL,
+            gwp_100        NUMERIC(20, 6) NOT NULL,
+            is_legacy      BOOLEAN NOT NULL DEFAULT false,
+            search_text    TEXT,
+            source_db      TEXT DEFAULT 'BAFU 2025',
+            created_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            updated_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );`,
+        // NOTE: no UNIQUE/dedup constraint — every source row is imported
+        // verbatim so the row count always matches the file exactly (10,305).
 
-        `ALTER TABLE emission_factors DROP COLUMN IF EXISTS material;`,
-        `ALTER TABLE emission_factors DROP COLUMN IF EXISTS process;`,
-        `ALTER TABLE emission_factors DROP COLUMN IF EXISTS activity_type;`,
-        `ALTER TABLE emission_factors DROP COLUMN IF EXISTS sub_category_3;`,
-        `ALTER TABLE emission_factors DROP COLUMN IF EXISTS sub_category_4;`,
-        `ALTER TABLE emission_factors DROP COLUMN IF EXISTS region;`,
-        `ALTER TABLE emission_factors DROP COLUMN IF EXISTS geo_fallback_chain;`,
-        `ALTER TABLE emission_factors DROP COLUMN IF EXISTS unit_kind;`,
-        `ALTER TABLE emission_factors DROP COLUMN IF EXISTS recycled_content;`,
-        `ALTER TABLE emission_factors DROP COLUMN IF EXISTS factor_suitability;`,
+        // --- Indexes ---
+        // Unit hard-gate lookup (domain + unit) — the primary access path.
+        `CREATE INDEX IF NOT EXISTS idx_emission_factors_domain_unit
+            ON emission_factors (domain, unit);`,
+        // Cascade dropdown / taxonomy navigation.
+        `CREATE INDEX IF NOT EXISTS idx_emission_factors_taxonomy
+            ON emission_factors (domain, category, sub_category, group_name);`,
+        // Geography filtering / fallback.
+        `CREATE INDEX IF NOT EXISTS idx_emission_factors_geography
+            ON emission_factors (geography);`,
+        // Fast path over live (non-legacy) rows only.
+        `CREATE INDEX IF NOT EXISTS idx_emission_factors_active
+            ON emission_factors (domain, unit) WHERE is_legacy = false;`,
+        // Fuzzy text matching for the semantic layer (requires pg_trgm).
+        `CREATE EXTENSION IF NOT EXISTS pg_trgm;`,
+        `CREATE INDEX IF NOT EXISTS idx_emission_factors_search_trgm
+            ON emission_factors USING gin (search_text gin_trgm_ops);`,
 
-        `DROP INDEX IF EXISTS idx_emission_factors_unit_kind;`,
+        // ============================================================
+        // 28-question supplier questionnaire (Catena-X PCF v9.0.0)
+        // Added 2026-06-15. See FINAL_POSTMAN_JSON.json and the
+        // Final_Catena-x_Reporting_Structure CSV for the source spec.
+        // ============================================================
 
-        `ALTER TABLE emission_factors ALTER COLUMN ef_id TYPE TEXT;`,
-        `ALTER TABLE emission_factors ALTER COLUMN category TYPE TEXT;`,
-        `ALTER TABLE emission_factors ALTER COLUMN sub_category_1 TYPE TEXT;`,
-        `ALTER TABLE emission_factors ALTER COLUMN sub_category_2 TYPE TEXT;`,
-        `ALTER TABLE emission_factors ALTER COLUMN country_code TYPE TEXT;`,
-        `ALTER TABLE emission_factors ALTER COLUMN country_name TYPE TEXT;`,
-        `ALTER TABLE emission_factors ALTER COLUMN unit TYPE TEXT;`,
-        `ALTER TABLE emission_factors ALTER COLUMN source_db TYPE TEXT;`,
+        // Main response: one row per supplier per PCF request.
+        // Holds every single-row Q answer; multi-row Qs live in sq_qN_* tables.
+        `CREATE TABLE IF NOT EXISTS supplier_questionnaire_response (
+            id VARCHAR(255) PRIMARY KEY,
+            bom_pcf_request_id VARCHAR(255) NOT NULL,
+            supplier_id VARCHAR(255) NOT NULL,
+            status VARCHAR(32) DEFAULT 'draft',
+            submitted_at TIMESTAMPTZ,
+            -- Q1 Company
+            company_name TEXT,
+            company_id_urn TEXT,
+            -- Q2 Product
+            product_name_company TEXT,
+            product_id_urn TEXT,
+            product_description TEXT,
+            product_classification_urn TEXT,
+            -- Q3 Declared unit
+            declared_unit VARCHAR(64),
+            declared_unit_amount DOUBLE PRECISION,
+            product_mass_per_declared_unit DOUBLE PRECISION,
+            -- Q5 Time
+            reference_period_start DATE,
+            reference_period_end DATE,
+            validity_period_start DATE,
+            validity_period_end DATE,
+            -- Q6 PCF type
+            retro_or_prospective_pcf_type VARCHAR(128),
+            -- Q7 System boundary (stores the full descriptive label from the UI)
+            system_boundary TEXT DEFAULT 'cradle-to-gate',
+            -- Q9 Co-products
+            co_products_present BOOLEAN DEFAULT FALSE,
+            -- Q15 Packaging include
+            packaging_emissions_included BOOLEAN DEFAULT TRUE,
+            -- Q18 Distribution boundary
+            distribution_stage_included BOOLEAN DEFAULT FALSE,
+            -- Q20 flat (multi-row biomass lives in sq_q20_biomass_feedstock)
+            uses_agricultural_forestry_land BOOLEAN,
+            land_area_hectares DOUBLE PRECISION,
+            forest_converted_y_n BOOLEAN,
+            luc_emission_factor DOUBLE PRECISION,
+            -- Q21 Standards
+            cross_sectoral_standards TEXT,
+            product_or_sector_specific_rules TEXT,
+            ipcc_gwp_version TEXT DEFAULT 'AR6',
+            -- Q22 Mass balancing
+            mass_balancing_used BOOLEAN DEFAULT FALSE,
+            mass_balancing_certificate_scheme TEXT,
+            free_attribution_in_mass_balancing BOOLEAN,
+            -- Q23 Allocation
+            allocation_rules_description TEXT,
+            allocation_recycled_carbon TEXT DEFAULT 'cut-off',
+            allocation_waste_incineration TEXT DEFAULT 'polluter pays principle',
+            -- Q24 Boundary
+            boundary_processes_description TEXT,
+            ccs_co2_capture_included BOOLEAN DEFAULT FALSE,
+            exempted_emissions_description TEXT,
+            exempted_emissions_percent DOUBLE PRECISION DEFAULT 0,
+            -- Q25 DQR
+            primary_data_share_pct DOUBLE PRECISION,
+            secondary_ef_sources TEXT,
+            data_collected_year INTEGER,
+            technological_dqr DOUBLE PRECISION,
+            temporal_dqr DOUBLE PRECISION,
+            geographical_dqr DOUBLE PRECISION,
+            -- Q26 Certification + Verification
+            is_product_certified BOOLEAN,
+            certification_scheme TEXT,
+            certificate_number TEXT,
+            certificate_valid_from DATE,
+            certificate_valid_to DATE,
+            is_pcf_verified BOOLEAN,
+            attestation_type TEXT,
+            attestation_conformant_standards TEXT,
+            attestation_scheme_standard TEXT,
+            attestation_of_conformance_id TEXT,
+            attestation_provider_name TEXT,
+            attestation_provider_id TEXT,
+            attestation_link TEXT,
+            attestation_completed_at TIMESTAMPTZ,
+            -- Q27 Volumes
+            total_production_volume DOUBLE PRECISION,
+            certified_volume DOUBLE PRECISION,
+            verified_volume_1st_party DOUBLE PRECISION,
+            verified_volume_2nd_party DOUBLE PRECISION,
+            verified_volume_3rd_party DOUBLE PRECISION,
+            total_product_volume DOUBLE PRECISION,
+            -- Q28 Comments
+            comments TEXT,
+            -- timestamps
+            update_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(bom_pcf_request_id, supplier_id)
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sqr_bom_pcf_request_id
+            ON supplier_questionnaire_response (bom_pcf_request_id);`,
+        `CREATE INDEX IF NOT EXISTS idx_sqr_supplier_id
+            ON supplier_questionnaire_response (supplier_id);`,
+        `CREATE INDEX IF NOT EXISTS idx_sqr_status
+            ON supplier_questionnaire_response (status);`,
 
-        `CREATE INDEX IF NOT EXISTS idx_emission_factors_source_db
-            ON emission_factors (source_db);`,
-        `CREATE INDEX IF NOT EXISTS idx_emission_factors_country_code
-            ON emission_factors (country_code);`,
-        `CREATE INDEX IF NOT EXISTS idx_emission_factors_reference_year
-            ON emission_factors (reference_year);`,
-        `CREATE INDEX IF NOT EXISTS idx_emission_factors_category
-            ON emission_factors (category);`,
-        `CREATE INDEX IF NOT EXISTS idx_emission_factors_sub_category_1
-            ON emission_factors (sub_category_1);`,
+        // Q10 electricity factory-allocation inputs (added later). Per-unit
+        // production electricity = (component_weight / factory_weight) ×
+        // factory_energy / num_products, then × electricity EF.
+        `ALTER TABLE supplier_questionnaire_response
+            ADD COLUMN IF NOT EXISTS factory_total_energy_kwh DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS factory_total_weight_kg DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS component_total_weight_kg DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS component_num_products DOUBLE PRECISION;`,
 
-        // --- Alloy / material composition cache --------------------------------
-        // Resolves a material description (e.g. "AlSi10Mg(Fe) alloy") into its
-        // constituent elements + weight-% ranges + BAFU layer mapping. Populated
-        // by a seed of common alloys (zero API) and, on a miss, by the free LLM
-        // layer (Gemini -> Groq -> Claude). Keyed by the normalised alloy string
-        // so each unique alloy is resolved at most once, ever.
-        `CREATE TABLE IF NOT EXISTS alloy_composition_cache (
-            alloy_key TEXT PRIMARY KEY,
-            alloy_label TEXT,
-            composition JSONB NOT NULL,
+        // Q4: manufacturing sites
+        `CREATE TABLE IF NOT EXISTS sq_q4_sites (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            site_name TEXT,
+            site_address TEXT,
+            region TEXT,
+            country VARCHAR(8),
+            country_subdivision VARCHAR(16),
+            is_primary BOOLEAN DEFAULT FALSE,
+            notes TEXT,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q4_response_id ON sq_q4_sites (response_id);`,
+
+        // Q8: BOM components
+        `CREATE TABLE IF NOT EXISTS sq_q8_bom (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            product_id_or_mpn TEXT,
+            component_name TEXT,
+            material TEXT,
+            process TEXT,
+            mass_pct DOUBLE PRECISION,
+            carbon_pct DOUBLE PRECISION,
+            biogenic_y_n BOOLEAN,
+            biogenic_carbon_pct DOUBLE PRECISION,
+            recycled_y_n BOOLEAN,
+            recycled_carbon_pct DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        // Q8 EF taxonomy (cascade). `material` already holds the Category value;
+        // add the deeper levels so the engine can match the exact EF row.
+        `ALTER TABLE sq_q8_bom
+            ADD COLUMN IF NOT EXISTS sub_category TEXT,
+            ADD COLUMN IF NOT EXISTS group_name TEXT,
+            ADD COLUMN IF NOT EXISTS specific_type TEXT;`,
+        // EF taxonomy cascade for the other emission tables (waste / packaging /
+        // packaging-transport / packaging-waste / transport). category +
+        // sub_category + group_name + specific_type pin the exact EF.
+        `ALTER TABLE supplier_questionnaire_response
+            ADD COLUMN IF NOT EXISTS form_snapshot JSONB;`,
+        `ALTER TABLE sq_q10_electricity
+            ADD COLUMN IF NOT EXISTS category TEXT,
+            ADD COLUMN IF NOT EXISTS sub_category TEXT,
+            ADD COLUMN IF NOT EXISTS group_name TEXT,
+            ADD COLUMN IF NOT EXISTS specific_type TEXT,
+            ADD COLUMN IF NOT EXISTS geography TEXT,
+            ADD COLUMN IF NOT EXISTS mpn TEXT;`,
+        `ALTER TABLE sq_q11_fuels
+            ADD COLUMN IF NOT EXISTS category TEXT,
+            ADD COLUMN IF NOT EXISTS sub_category TEXT,
+            ADD COLUMN IF NOT EXISTS group_name TEXT,
+            ADD COLUMN IF NOT EXISTS specific_type TEXT,
+            ADD COLUMN IF NOT EXISTS mpn TEXT;`,
+        `ALTER TABLE sq_q13_qc_it_energy
+            ADD COLUMN IF NOT EXISTS category TEXT,
+            ADD COLUMN IF NOT EXISTS sub_category TEXT,
+            ADD COLUMN IF NOT EXISTS group_name TEXT,
+            ADD COLUMN IF NOT EXISTS specific_type TEXT,
+            ADD COLUMN IF NOT EXISTS geography TEXT,
+            ADD COLUMN IF NOT EXISTS mpn TEXT,
+            ADD COLUMN IF NOT EXISTS equipment_type TEXT;`,
+        `ALTER TABLE sq_q14_production_waste
+            ADD COLUMN IF NOT EXISTS category TEXT,
+            ADD COLUMN IF NOT EXISTS sub_category TEXT,
+            ADD COLUMN IF NOT EXISTS group_name TEXT,
+            ADD COLUMN IF NOT EXISTS specific_type TEXT;`,
+        `ALTER TABLE sq_q16_packaging_materials
+            ADD COLUMN IF NOT EXISTS category TEXT,
+            ADD COLUMN IF NOT EXISTS sub_category TEXT,
+            ADD COLUMN IF NOT EXISTS group_name TEXT,
+            ADD COLUMN IF NOT EXISTS specific_type TEXT;`,
+        `ALTER TABLE sq_q16a_packaging_transport
+            ADD COLUMN IF NOT EXISTS category TEXT,
+            ADD COLUMN IF NOT EXISTS sub_category TEXT,
+            ADD COLUMN IF NOT EXISTS group_name TEXT,
+            ADD COLUMN IF NOT EXISTS specific_type TEXT;`,
+        `ALTER TABLE sq_q17_packaging_waste
+            ADD COLUMN IF NOT EXISTS category TEXT,
+            ADD COLUMN IF NOT EXISTS sub_category TEXT,
+            ADD COLUMN IF NOT EXISTS group_name TEXT,
+            ADD COLUMN IF NOT EXISTS specific_type TEXT;`,
+        `ALTER TABLE sq_q19_transport_legs
+            ADD COLUMN IF NOT EXISTS category TEXT,
+            ADD COLUMN IF NOT EXISTS sub_category TEXT,
+            ADD COLUMN IF NOT EXISTS group_name TEXT,
+            ADD COLUMN IF NOT EXISTS specific_type TEXT;`,
+        // --- Widen narrow questionnaire text columns to VARCHAR(100). ---------
+        // These were originally sized for ISO codes (country=8, subdivision=16)
+        // or short enums, but the form lets suppliers type full names (e.g. a
+        // state name > 16 chars) → "value too long for type character varying(16)"
+        // on submit. Runs after the CREATE TABLEs above, so it fixes both the
+        // existing live DB and fresh installs. Idempotent: re-widening to the
+        // same type is a no-op. Widen, never narrow (safe on existing data).
+        `ALTER TABLE sq_q4_sites
+            ALTER COLUMN country TYPE VARCHAR(100),
+            ALTER COLUMN country_subdivision TYPE VARCHAR(100);`,
+        `ALTER TABLE sq_q9a_coproducts
+            ALTER COLUMN price_currency TYPE VARCHAR(100);`,
+        `ALTER TABLE sq_q10_electricity ALTER COLUMN unit TYPE VARCHAR(100);`,
+        `ALTER TABLE sq_q11_fuels ALTER COLUMN unit TYPE VARCHAR(100);`,
+        `ALTER TABLE sq_q12_process_gases
+            ALTER COLUMN fossil_or_biogenic TYPE VARCHAR(100),
+            ALTER COLUMN unit TYPE VARCHAR(100);`,
+        `ALTER TABLE sq_q13_qc_it_energy ALTER COLUMN unit TYPE VARCHAR(100);`,
+        `ALTER TABLE sq_q14_production_waste ALTER COLUMN unit TYPE VARCHAR(100);`,
+        `ALTER TABLE sq_q16_packaging_materials
+            ALTER COLUMN country TYPE VARCHAR(100),
+            ALTER COLUMN unit TYPE VARCHAR(100);`,
+        `ALTER TABLE sq_q16a_packaging_transport ALTER COLUMN unit TYPE VARCHAR(100);`,
+        `ALTER TABLE sq_q17_packaging_waste ALTER COLUMN unit TYPE VARCHAR(100);`,
+        `ALTER TABLE sq_q19_transport_legs ALTER COLUMN unit TYPE VARCHAR(100);`,
+        `ALTER TABLE sq_q20_biomass_feedstock ALTER COLUMN unit TYPE VARCHAR(100);`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q8_response_id ON sq_q8_bom (response_id);`,
+
+        // Q9a: co-products
+        `CREATE TABLE IF NOT EXISTS sq_q9a_coproducts (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            component_name TEXT,
+            co_product_name TEXT,
+            co_product_price DOUBLE PRECISION,
+            price_currency VARCHAR(16),
+            is_primary_product BOOLEAN DEFAULT FALSE,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q9a_response_id ON sq_q9a_coproducts (response_id);`,
+
+        // Q10: electricity
+        `CREATE TABLE IF NOT EXISTS sq_q10_electricity (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            electricity_type TEXT,
+            generator_type TEXT,
+            quantity DOUBLE PRECISION,
+            unit VARCHAR(32),
+            renewable_pct DOUBLE PRECISION,
+            renewable_sourcing TEXT,
+            infrastructure_emissions_included BOOLEAN,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q10_response_id ON sq_q10_electricity (response_id);`,
+
+        // Q10a: per-product total weight produced at the factory (one row per MPN).
+        // Summed across rows → factory-total weight = the electricity allocation
+        // denominator. Q10b: units produced per product.
+        `CREATE TABLE IF NOT EXISTS sq_q10a_factory_weights (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            total_weight_kg DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q10a_response_id ON sq_q10a_factory_weights (response_id);`,
+        `CREATE TABLE IF NOT EXISTS sq_q10b_factory_units (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            units_produced DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q10b_response_id ON sq_q10b_factory_units (response_id);`,
+
+        // Q8b: process consumable materials (auxiliaries) used in production but
+        // NOT in the BOM. mass-allocated per component × EF, added to the total.
+        `CREATE TABLE IF NOT EXISTS sq_q8b_process_consumables (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            consumable_material TEXT,
+            category TEXT,
+            sub_category TEXT,
+            group_name TEXT,
+            specific_type TEXT,
+            total_quantity DOUBLE PRECISION,
+            unit VARCHAR(100),
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q8b_response_id ON sq_q8b_process_consumables (response_id);`,
+
+        // Q8c: inbound raw-material transport legs to the manufacturing site.
+        // Emission per unit = (weight_tonnes ÷ Q10b_units) × distance_km × EF(tkm),
+        // with EF from 4-level taxonomy + Q4 Country→Region→Global fallback.
+        `CREATE TABLE IF NOT EXISTS sq_q8c_raw_material_transport (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            category TEXT,
+            sub_category TEXT,
+            group_name TEXT,
+            specific_type TEXT,
+            source TEXT,
+            destination TEXT,
+            weight DOUBLE PRECISION,
+            unit VARCHAR(100),
+            distance_km DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q8c_response_id ON sq_q8c_raw_material_transport (response_id);`,
+
+        // Q11: fuels / energy carriers
+        `CREATE TABLE IF NOT EXISTS sq_q11_fuels (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            fuel_carrier TEXT,
+            quantity DOUBLE PRECISION,
+            unit VARCHAR(32),
+            biogenic_y_n BOOLEAN,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q11_response_id ON sq_q11_fuels (response_id);`,
+
+        // Q12: direct process gases
+        `CREATE TABLE IF NOT EXISTS sq_q12_process_gases (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            direct_process_gas TEXT,
+            quantity DOUBLE PRECISION,
+            unit VARCHAR(32),
+            fossil_or_biogenic VARCHAR(16),
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q12_response_id ON sq_q12_process_gases (response_id);`,
+
+        // Q13: QC / IT energy
+        `CREATE TABLE IF NOT EXISTS sq_q13_qc_it_energy (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            item TEXT,
+            value DOUBLE PRECISION,
+            unit VARCHAR(32),
+            already_in_q10 BOOLEAN DEFAULT FALSE,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q13_response_id ON sq_q13_qc_it_energy (response_id);`,
+
+        // Q14: production / QC waste
+        `CREATE TABLE IF NOT EXISTS sq_q14_production_waste (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            product_id_or_mpn TEXT,
+            component_name TEXT,
+            waste_type TEXT,
+            treatment_type TEXT,
+            quantity DOUBLE PRECISION,
+            unit VARCHAR(32),
+            energy_recovered BOOLEAN,
+            polluter_pays_applied BOOLEAN,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q14_response_id ON sq_q14_production_waste (response_id);`,
+
+        // Q14a: production-waste transport to treatment.
+        // Emission per leg = weight_tonnes × distance_km × EF(tkm)
+        // (kg→tonnes via /1000). EF from 4-level taxonomy + Q4 Country→Region→Global.
+        `CREATE TABLE IF NOT EXISTS sq_q14a_production_waste_transport (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            category TEXT,
+            sub_category TEXT,
+            group_name TEXT,
+            specific_type TEXT,
+            source TEXT,
+            destination TEXT,
+            weight DOUBLE PRECISION,
+            unit VARCHAR(100),
+            distance_km DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q14a_response_id ON sq_q14a_production_waste_transport (response_id);`,
+
+        // Q16: packaging materials
+        `CREATE TABLE IF NOT EXISTS sq_q16_packaging_materials (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            product_id_or_mpn TEXT,
+            component_name TEXT,
+            packaging_type TEXT,
+            process_type TEXT,
+            packaging_weight DOUBLE PRECISION,
+            unit VARCHAR(32),
+            region TEXT,
+            country VARCHAR(8),
+            recycled_pct DOUBLE PRECISION,
+            carbon_biogenic_pct DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q16_response_id ON sq_q16_packaging_materials (response_id);`,
+
+        // Q16a: packaging transport
+        `CREATE TABLE IF NOT EXISTS sq_q16a_packaging_transport (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            packaging_product_id_or_mpn TEXT,
+            component_name TEXT,
+            transport_mode TEXT,
+            weight DOUBLE PRECISION,
+            unit VARCHAR(32),
+            distance_km DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q16a_response_id ON sq_q16a_packaging_transport (response_id);`,
+
+        // Q17: packaging waste
+        `CREATE TABLE IF NOT EXISTS sq_q17_packaging_waste (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn_code TEXT,
+            component_name TEXT,
+            packaging_waste_type TEXT,
+            treatment_type TEXT,
+            quantity DOUBLE PRECISION,
+            unit VARCHAR(32),
+            energy_recovered BOOLEAN,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q17_response_id ON sq_q17_packaging_waste (response_id);`,
+
+        // Q17a: packaging-waste transport to treatment.
+        // Emission per leg = weight_tonnes × distance_km × EF(tkm) (kg→tonnes).
+        // EF from 4-level taxonomy + Q4 Country→Region→Global fallback.
+        `CREATE TABLE IF NOT EXISTS sq_q17a_packaging_waste_transport (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            category TEXT,
+            sub_category TEXT,
+            group_name TEXT,
+            specific_type TEXT,
+            source TEXT,
+            destination TEXT,
+            weight DOUBLE PRECISION,
+            unit VARCHAR(100),
+            distance_km DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q17a_response_id ON sq_q17a_packaging_waste_transport (response_id);`,
+
+        // Q19: distribution transport legs
+        `CREATE TABLE IF NOT EXISTS sq_q19_transport_legs (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            product_id_or_mpn TEXT,
+            component_name TEXT,
+            transport_mode TEXT,
+            source TEXT,
+            destination TEXT,
+            weight DOUBLE PRECISION,
+            unit VARCHAR(32),
+            distance_km DOUBLE PRECISION,
+            low_carbon_fuel BOOLEAN,
+            fuel_certificate_ref TEXT,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q19_response_id ON sq_q19_transport_legs (response_id);`,
+
+        // Q20: biomass feedstock (multi-row part; flat fields live on main response)
+        `CREATE TABLE IF NOT EXISTS sq_q20_biomass_feedstock (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            biomass_feedstock_type TEXT,
+            quantity DOUBLE PRECISION,
+            unit VARCHAR(32),
+            biogenic_carbon_content_pct DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q20_response_id ON sq_q20_biomass_feedstock (response_id);`,
+
+        // ============================================================
+        // Config + audit tables for EF matching engine and formula engine
+        // ============================================================
+
+        // IPCC GWP characterization factors (AR4/AR5/AR6 ... CH4/N2O/...)
+        // Seeded by a separate seeder when admin first runs the app.
+        `CREATE TABLE IF NOT EXISTS gwp_factors (
+            id VARCHAR(255) PRIMARY KEY,
+            ipcc_version VARCHAR(16) NOT NULL,
+            gas VARCHAR(32) NOT NULL,
+            gwp_100y DOUBLE PRECISION NOT NULL,
+            gwp_20y DOUBLE PRECISION,
             source TEXT,
             created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-            updated_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            UNIQUE(ipcc_version, gas)
         );`,
+        `CREATE INDEX IF NOT EXISTS idx_gwp_factors_version ON gwp_factors (ipcc_version);`,
 
-        // Seed of common alloys (auto-parts set). composition is a JSON array of
-        // { element, min_pct, max_pct, bafu_category, bafu_process, bafu_sub2 }.
-        // ON CONFLICT keeps any later LLM/manual refinement intact.
-        // Keys are alphanumeric-normalised (lowercase, no punctuation) to match
-        // alloyCompositionService.normalizeAlloyKey, with aliases so the same
-        // alloy is found whether the description says "AlSi9Cu3(Fe)", "AlSi9Cu3",
-        // or "ADC12".
-        `INSERT INTO alloy_composition_cache (alloy_key, alloy_label, composition, source) VALUES
-            ('alsi10mgfe', 'AlSi10Mg(Fe)', '[
-                {"element":"Aluminium","min_pct":88,"max_pct":91,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Silicon","min_pct":9,"max_pct":11,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Magnesium","min_pct":0.2,"max_pct":0.45,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Iron","min_pct":0,"max_pct":0.55,"bafu_category":"metals","bafu_process":"ferro","bafu_sub2":""}
-            ]', 'seed'),
-            ('alsi10mg', 'AlSi10Mg(Fe)', '[
-                {"element":"Aluminium","min_pct":88,"max_pct":91,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Silicon","min_pct":9,"max_pct":11,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Magnesium","min_pct":0.2,"max_pct":0.45,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Iron","min_pct":0,"max_pct":0.55,"bafu_category":"metals","bafu_process":"ferro","bafu_sub2":""}
-            ]', 'seed'),
-            ('alsi9cu3fe', 'AlSi9Cu3(Fe) / ADC12', '[
-                {"element":"Aluminium","min_pct":80,"max_pct":86,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Silicon","min_pct":9.6,"max_pct":12,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Copper","min_pct":1.5,"max_pct":3.5,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Iron","min_pct":0,"max_pct":1.3,"bafu_category":"metals","bafu_process":"ferro","bafu_sub2":""},
-                {"element":"Zinc","min_pct":0,"max_pct":1,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""}
-            ]', 'seed'),
-            ('alsi9cu3', 'AlSi9Cu3(Fe) / ADC12', '[
-                {"element":"Aluminium","min_pct":80,"max_pct":86,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Silicon","min_pct":9.6,"max_pct":12,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Copper","min_pct":1.5,"max_pct":3.5,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Iron","min_pct":0,"max_pct":1.3,"bafu_category":"metals","bafu_process":"ferro","bafu_sub2":""},
-                {"element":"Zinc","min_pct":0,"max_pct":1,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""}
-            ]', 'seed'),
-            ('adc12', 'ADC12', '[
-                {"element":"Aluminium","min_pct":80,"max_pct":86,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Silicon","min_pct":9.6,"max_pct":12,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Copper","min_pct":1.5,"max_pct":3.5,"bafu_category":"metals","bafu_process":"non ferro","bafu_sub2":""},
-                {"element":"Iron","min_pct":0,"max_pct":1.3,"bafu_category":"metals","bafu_process":"ferro","bafu_sub2":""}
-            ]', 'seed')
-        ON CONFLICT (alloy_key) DO NOTHING;`,
-
-        // --- Material -> BAFU emission-factor product mapping -------------------
-        // For raw-material emissions, each material is matched to ONE specific
-        // BAFU product (e.g. Aluminium -> "production mix, cast alloy"), then the
-        // HIGHEST emission factor across all countries for that product is used
-        // (per the manager's PCF logic sheet). product_pattern is a case-
-        // insensitive ILIKE pattern against emission_factors.product.
-        `CREATE TABLE IF NOT EXISTS material_ef_mapping (
-            material_key TEXT PRIMARY KEY,
-            material_label TEXT,
-            bafu_category TEXT NOT NULL,
-            product_pattern TEXT NOT NULL,
-            note TEXT,
+        // EF scoring weights per activity type (material, packaging, transport, waste, energy, fuels, gases).
+        // criterion examples: material, process, geography, year, unit, recycled.
+        // scoring_rules_json carries graded match rules (exact / region / GLO / RoW etc.).
+        `CREATE TABLE IF NOT EXISTS ef_scoring_config (
+            id VARCHAR(255) PRIMARY KEY,
+            activity_type VARCHAR(64) NOT NULL,
+            criterion VARCHAR(64) NOT NULL,
+            weight INTEGER NOT NULL,
+            scoring_rules_json JSONB,
+            update_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
             created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-            updated_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            UNIQUE(activity_type, criterion)
         );`,
+        `CREATE INDEX IF NOT EXISTS idx_ef_scoring_config_activity
+            ON ef_scoring_config (activity_type);`,
 
-        `INSERT INTO material_ef_mapping (material_key, material_label, bafu_category, product_pattern, note) VALUES
-            ('aluminium', 'Aluminium', 'metals', 'aluminium, production mix, cast alloy%', 'casting form; highest EF = RER 4.27'),
-            ('silicon',   'Silicon',   'metals', 'mg-silicon%',                            'metallurgical grade; highest EF = CN 12.62'),
-            ('magnesium', 'Magnesium', 'metals', 'magnesium, at plant%',                   'primary; highest EF = RER 76.11'),
-            ('iron',      'Iron',      'metals', 'pig iron, at plant%',                     'primary; highest EF = RER 2.20'),
-            ('copper',    'Copper',    'metals', 'copper, primary, at refinery%',           'primary; highest EF = RAS 3.99'),
-            ('zinc',      'Zinc',      'metals', 'zinc, primary, at regional storage%',     'primary; highest EF = RER 3.02'),
-            ('cardboard corrugated', 'Cardboard Corrugated', 'paper+ board', 'packaging, corrugated board%', 'packaging; highest EF = CH 1.218'),
-            ('cardboard', 'Cardboard', 'paper+ board', 'packaging, corrugated board%', 'packaging; highest EF = CH 1.218'),
-            ('corrugated board', 'Corrugated Board', 'paper+ board', 'packaging, corrugated board%', 'packaging; highest EF = CH 1.218'),
-            ('plastic film ldpe', 'Plastic Film (LDPE)', 'plastics', 'packaging film, ldpe%', 'packaging; LDPE film'),
-            ('wooden pallet', 'Wooden Pallet', 'wood', 'eur-flat pallet%', 'packaging; wooden pallet'),
-            ('road', 'Road (Truck)', 'transport systems', 'transport, freight, lorry, diesel, 32t%', 'transport; per tkm; ~0.22'),
-            ('truck', 'Truck', 'transport systems', 'transport, freight, lorry, diesel, 32t%', 'transport; per tkm; ~0.22'),
-            ('ship', 'Ship', 'transport systems', 'transport, transoceanic container ship%', 'transport; per tkm; ~0.016'),
-            ('train', 'Train (Rail)', 'transport systems', 'transport, freight, rail%', 'transport; per tkm; ~0.017'),
-            ('rail', 'Rail', 'transport systems', 'transport, freight, rail%', 'transport; per tkm; ~0.017'),
-            ('waste:aluminium', 'Aluminium (scrap)', 'metals', 'aluminium scrap, new%', 'production waste; aluminium scrap ~0.0222'),
-            ('waste:cardboard corrugated', 'Cardboard (waste)', 'paper+ board', 'waste paper, sorted%', 'packaging waste; waste paper ~0.091'),
-            ('waste:cardboard', 'Cardboard (waste)', 'paper+ board', 'waste paper, sorted%', 'packaging waste; waste paper ~0.091'),
-            ('waste:corrugated board', 'Corrugated (waste)', 'paper+ board', 'waste paper, sorted%', 'packaging waste; waste paper ~0.091')
-        ON CONFLICT (material_key) DO NOTHING;`,
+        // EF match audit — every EF pick logged (ISO 14067 / Catena-X audit trail).
+        `CREATE TABLE IF NOT EXISTS ef_match_audit (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            source_question VARCHAR(64) NOT NULL,
+            source_row_id VARCHAR(255),
+            activity_type VARCHAR(64) NOT NULL,
+            input_payload_json JSONB,
+            winning_ef_id TEXT,
+            winning_score DOUBLE PRECISION,
+            confidence_band VARCHAR(16),
+            alternatives_json JSONB,
+            scoring_config_version INTEGER DEFAULT 1,
+            matched_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_ef_match_audit_response
+            ON ef_match_audit (response_id);`,
+        `CREATE INDEX IF NOT EXISTS idx_ef_match_audit_question
+            ON ef_match_audit (source_question);`,
 
-        // `kind` distinguishes raw-material mappings (Q7), packaging-type
-        // mappings (Q8), and transport-mode mappings (Q10).
-        `ALTER TABLE material_ef_mapping ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT 'material';`,
-        `UPDATE material_ef_mapping SET kind = 'packaging'
-            WHERE material_key IN ('cardboard corrugated','cardboard','corrugated board','plastic film ldpe','wooden pallet');`,
-        `UPDATE material_ef_mapping SET kind = 'transport'
-            WHERE material_key IN ('road','truck','ship','train','rail');`,
+        // PCF computed field — every calculated v9 field stored for replay/audit.
+        // field_path e.g. "productionStage.fossilGhgEmissions" or "carbonContent.biogenicCarbonContent".
+        `CREATE TABLE IF NOT EXISTS pcf_computed_field (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            field_path TEXT NOT NULL,
+            value DOUBLE PRECISION,
+            formula_used TEXT,
+            inputs_json JSONB,
+            computed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_pcf_computed_field_response
+            ON pcf_computed_field (response_id);`,
+        `CREATE INDEX IF NOT EXISTS idx_pcf_computed_field_path
+            ON pcf_computed_field (field_path);`,
 
-        // Transport modes pin the EXACT BAFU row (too many fuel/euro variants for
-        // a pattern + "highest" to land on the representative average).
-        `ALTER TABLE material_ef_mapping ADD COLUMN IF NOT EXISTS bafu_ef_id TEXT;`,
-        // EF_07454 lorry 16-32t fleet avg ~0.22 ; EF_08639 transoceanic ~0.016 ; EF_07830 freight rail ~0.017
-        `UPDATE material_ef_mapping SET bafu_ef_id = 'EF_07454' WHERE material_key IN ('road','truck');`,
-        `UPDATE material_ef_mapping SET bafu_ef_id = 'EF_08639' WHERE material_key = 'ship';`,
-        `UPDATE material_ef_mapping SET bafu_ef_id = 'EF_07830' WHERE material_key IN ('train','rail');`,
+        // DQR V3 rating — one row per rated emission line of the new 28-Q
+        // questionnaire. Replaces the 50 legacy per-question dqr_* tables, which
+        // the V3 questionnaire cannot populate. Keyed by (response_id, source_row_id)
+        // so each emission line (sq_q8_bom / sq_q10_electricity / sq_q12 / sq_q14 /
+        // sq_q16 / sq_q17 / sq_q19 row) maps to exactly one DQR data point. Holds
+        // the same five-dimension tag model (TeR/TiR/GR/C/PDS) the page already uses.
+        `CREATE TABLE IF NOT EXISTS dqr_v3_rating (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            source_question VARCHAR(32) NOT NULL,
+            source_row_id VARCHAR(255) NOT NULL,
+            sgiq_id VARCHAR(255),
+            data TEXT,
+            ter_tag_type VARCHAR(255),
+            ter_tag_value VARCHAR(255),
+            ter_data_point VARCHAR(255),
+            tir_tag_type VARCHAR(255),
+            tir_tag_value VARCHAR(255),
+            tir_data_point VARCHAR(255),
+            gr_tag_type VARCHAR(255),
+            gr_tag_value VARCHAR(255),
+            gr_data_point VARCHAR(255),
+            c_tag_type VARCHAR(255),
+            c_tag_value VARCHAR(255),
+            c_data_point VARCHAR(255),
+            pds_tag_type VARCHAR(255),
+            pds_tag_value VARCHAR(255),
+            pds_data_point VARCHAR(255),
+            created_by VARCHAR(255),
+            updated_by VARCHAR(255),
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            update_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT uq_dqr_v3_rating_line UNIQUE (response_id, source_row_id)
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_dqr_v3_rating_response
+            ON dqr_v3_rating (response_id);`,
 
-        // Waste mappings (Q9): material/packaging -> its scrap/waste BAFU row.
-        `UPDATE material_ef_mapping SET kind = 'waste' WHERE material_key LIKE 'waste:%';`,
-        `UPDATE material_ef_mapping SET bafu_ef_id = 'EF_00078' WHERE material_key = 'waste:aluminium';`,
-        `UPDATE material_ef_mapping SET bafu_ef_id = 'EF_08899' WHERE material_key IN ('waste:cardboard corrugated','waste:cardboard','waste:corrugated board');`,
+        // ============================================================
+        // Seed: GWP characterization factors (IPCC AR4 / AR5 / AR6, 100-year)
+        // Sources: IPCC AR4 WG1 Ch.2 (2007), AR5 WG1 Ch.8 (2013), AR6 WG1 Ch.7 (2021).
+        // CO2 is always 1 (reference gas). CH4 / N2O are the two we use in our formulas.
+        // SF6, NF3, HFCs included for completeness — useful if process gases (Q12) reports them.
+        // ============================================================
+        `INSERT INTO gwp_factors (id, ipcc_version, gas, gwp_100y, gwp_20y, source) VALUES
+            ('gwp_ar4_co2',  'AR4', 'CO2',  1,    1,    'IPCC AR4 WG1 (2007)'),
+            ('gwp_ar4_ch4',  'AR4', 'CH4',  25,   72,   'IPCC AR4 WG1 (2007)'),
+            ('gwp_ar4_n2o',  'AR4', 'N2O',  298,  289,  'IPCC AR4 WG1 (2007)'),
+            ('gwp_ar4_sf6',  'AR4', 'SF6',  22800,16300,'IPCC AR4 WG1 (2007)'),
+            ('gwp_ar5_co2',  'AR5', 'CO2',  1,    1,    'IPCC AR5 WG1 (2013), no feedbacks'),
+            ('gwp_ar5_ch4',  'AR5', 'CH4',  28,   84,   'IPCC AR5 WG1 (2013), no feedbacks'),
+            ('gwp_ar5_n2o',  'AR5', 'N2O',  265,  264,  'IPCC AR5 WG1 (2013), no feedbacks'),
+            ('gwp_ar5_sf6',  'AR5', 'SF6',  23500,17500,'IPCC AR5 WG1 (2013)'),
+            ('gwp_ar5_nf3',  'AR5', 'NF3',  16100,12800,'IPCC AR5 WG1 (2013)'),
+            ('gwp_ar6_co2',  'AR6', 'CO2',  1,    1,    'IPCC AR6 WG1 Ch.7 (2021)'),
+            ('gwp_ar6_ch4',  'AR6', 'CH4',  27.9, 82.5, 'IPCC AR6 WG1 Ch.7 (2021), non-fossil 27.0 / fossil 29.8 averaged'),
+            ('gwp_ar6_n2o',  'AR6', 'N2O',  273,  273,  'IPCC AR6 WG1 Ch.7 (2021)'),
+            ('gwp_ar6_sf6',  'AR6', 'SF6',  25200,18300,'IPCC AR6 WG1 Ch.7 (2021)'),
+            ('gwp_ar6_nf3',  'AR6', 'NF3',  17400,13400,'IPCC AR6 WG1 Ch.7 (2021)')
+         ON CONFLICT (ipcc_version, gas) DO NOTHING;`,
+
+        // ============================================================
+        // Seed: EF scoring weights — MATERIAL activity type.
+        // Other activity types (packaging / energy / fuels / transport / waste / gases)
+        // will be seeded when team confirms their weights.
+        // ============================================================
+        `INSERT INTO ef_scoring_config (id, activity_type, criterion, weight, scoring_rules_json) VALUES
+            ('efsc_material_material',  'material', 'material',  40,
+                '{"exact": 40, "same_family": 25, "different": 0}'::jsonb),
+            ('efsc_material_process',   'material', 'process',   30,
+                '{"exact": 30, "related": 15, "different": 5, "missing": 0}'::jsonb),
+            ('efsc_material_geography', 'material', 'geography', 15,
+                '{"same_country": 15, "same_region": 10, "GLO": 5, "RoW": 2}'::jsonb),
+            ('efsc_material_unit',      'material', 'unit',      10,
+                '{"exact_unit": 10, "same_unit_family_convertible": 7, "different_family": 0}'::jsonb),
+            ('efsc_material_year',      'material', 'year',      5,
+                '{"exact_year": 5, "within_1y": 4, "within_3y": 2, "older": 0}'::jsonb)
+         ON CONFLICT (activity_type, criterion) DO NOTHING;`,
+
+        // ============================================================
+        // Seed: EF scoring weights — the remaining 6 activity types.
+        // Same criteria/weights as material (40/30/15/10/5). Matchers map onto
+        // the real BAFU columns (product/category/sub_category_1/sub_category_2,
+        // country_code/country_name, unit, reference_year). Tune per-type later.
+        // ============================================================
+        `INSERT INTO ef_scoring_config (id, activity_type, criterion, weight, scoring_rules_json) VALUES
+            ('efsc_packaging_material',  'packaging', 'material',  40, '{"exact": 40, "same_family": 25, "different": 0}'::jsonb),
+            ('efsc_packaging_process',   'packaging', 'process',   30, '{"exact": 30, "related": 15, "different": 5, "missing": 0}'::jsonb),
+            ('efsc_packaging_geography', 'packaging', 'geography', 15, '{"same_country": 15, "same_region": 10, "GLO": 5, "RoW": 2}'::jsonb),
+            ('efsc_packaging_unit',      'packaging', 'unit',      10, '{"exact_unit": 10, "different_family": 0}'::jsonb),
+            ('efsc_packaging_year',      'packaging', 'year',      5,  '{"exact_year": 5, "within_1y": 4, "within_3y": 2, "older": 0}'::jsonb),
+
+            ('efsc_transport_material',  'transport', 'material',  40, '{"exact": 40, "same_family": 25, "different": 0}'::jsonb),
+            ('efsc_transport_process',   'transport', 'process',   30, '{"exact": 30, "related": 15, "different": 5, "missing": 0}'::jsonb),
+            ('efsc_transport_geography', 'transport', 'geography', 15, '{"same_country": 15, "same_region": 10, "GLO": 5, "RoW": 2}'::jsonb),
+            ('efsc_transport_unit',      'transport', 'unit',      10, '{"exact_unit": 10, "different_family": 0}'::jsonb),
+            ('efsc_transport_year',      'transport', 'year',      5,  '{"exact_year": 5, "within_1y": 4, "within_3y": 2, "older": 0}'::jsonb),
+
+            ('efsc_waste_material',      'waste', 'material',  40, '{"exact": 40, "same_family": 25, "different": 0}'::jsonb),
+            ('efsc_waste_process',       'waste', 'process',   30, '{"exact": 30, "related": 15, "different": 5, "missing": 0}'::jsonb),
+            ('efsc_waste_geography',     'waste', 'geography', 15, '{"same_country": 15, "same_region": 10, "GLO": 5, "RoW": 2}'::jsonb),
+            ('efsc_waste_unit',          'waste', 'unit',      10, '{"exact_unit": 10, "different_family": 0}'::jsonb),
+            ('efsc_waste_year',          'waste', 'year',      5,  '{"exact_year": 5, "within_1y": 4, "within_3y": 2, "older": 0}'::jsonb),
+
+            ('efsc_energy_material',     'energy', 'material',  40, '{"exact": 40, "same_family": 25, "different": 0}'::jsonb),
+            ('efsc_energy_process',      'energy', 'process',   30, '{"exact": 30, "related": 15, "different": 5, "missing": 0}'::jsonb),
+            ('efsc_energy_geography',    'energy', 'geography', 15, '{"same_country": 15, "same_region": 10, "GLO": 5, "RoW": 2}'::jsonb),
+            ('efsc_energy_unit',         'energy', 'unit',      10, '{"exact_unit": 10, "different_family": 0}'::jsonb),
+            ('efsc_energy_year',         'energy', 'year',      5,  '{"exact_year": 5, "within_1y": 4, "within_3y": 2, "older": 0}'::jsonb),
+
+            ('efsc_fuels_material',      'fuels', 'material',  40, '{"exact": 40, "same_family": 25, "different": 0}'::jsonb),
+            ('efsc_fuels_process',       'fuels', 'process',   30, '{"exact": 30, "related": 15, "different": 5, "missing": 0}'::jsonb),
+            ('efsc_fuels_geography',     'fuels', 'geography', 15, '{"same_country": 15, "same_region": 10, "GLO": 5, "RoW": 2}'::jsonb),
+            ('efsc_fuels_unit',          'fuels', 'unit',      10, '{"exact_unit": 10, "different_family": 0}'::jsonb),
+            ('efsc_fuels_year',          'fuels', 'year',      5,  '{"exact_year": 5, "within_1y": 4, "within_3y": 2, "older": 0}'::jsonb),
+
+            ('efsc_gas_material',        'process_gas', 'material',  40, '{"exact": 40, "same_family": 25, "different": 0}'::jsonb),
+            ('efsc_gas_process',         'process_gas', 'process',   30, '{"exact": 30, "related": 15, "different": 5, "missing": 0}'::jsonb),
+            ('efsc_gas_geography',       'process_gas', 'geography', 15, '{"same_country": 15, "same_region": 10, "GLO": 5, "RoW": 2}'::jsonb),
+            ('efsc_gas_unit',            'process_gas', 'unit',      10, '{"exact_unit": 10, "different_family": 0}'::jsonb),
+            ('efsc_gas_year',            'process_gas', 'year',      5,  '{"exact_year": 5, "within_1y": 4, "within_3y": 2, "older": 0}'::jsonb)
+         ON CONFLICT (activity_type, criterion) DO NOTHING;`,
 
     ]
 

@@ -30,7 +30,6 @@ export async function sendMail(payload: SendMailPayload) {
             saveToSentItems: true
         };
 
-                console.log("📧 Sending email with body:", JSON.stringify(body, null, 2)); // Debug log
 
 
       const response =  await axios.post(url, body, {

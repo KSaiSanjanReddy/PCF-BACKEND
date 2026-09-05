@@ -1,6 +1,7 @@
 import { withClient } from '../util/database.js';
 import { generateResponse } from '../util/genRes.js';
 import { createDqrRatingService, getSupplierDqrDetailsService, updateDqrRatingService } from "../services/dqrRatingService.js";
+import { getV3DqrDataPoints, isV3DqrType, updateV3DqrRating } from "../services/dqrV3Service.js";
 
 const ALLOWED_TYPES = [
     "dqr_raw_material_product_rating",
@@ -413,6 +414,16 @@ export async function getSupplierDqrDetailsById(req: any, res: any) {
                 .json(generateResponse(false, "sgiq_id is required", 400, null));
         }
 
+        // V3 (28-Q) questionnaires don't populate the legacy dqr_* tables; derive
+        // the data points from the V3 emission lines instead. Returns null for
+        // legacy requests, which fall through to the original service below.
+        const v3 = await getV3DqrDataPoints(sgiq_id);
+        if (v3) {
+            return res
+                .status(200)
+                .json(generateResponse(true, "Fetched successfully", 200, v3));
+        }
+
         const data = await getSupplierDqrDetailsService(sgiq_id);
 
         if (!data) {
@@ -436,12 +447,6 @@ export async function updateDqrRating(req: any, res: any) {
     try {
         const { type, records } = req.body;
 
-        if (!type || !DQR_CONFIG[type]) {
-            return res.status(400).json(
-                generateResponse(false, "Invalid DQR type", 400, Object.keys(DQR_CONFIG))
-            );
-        }
-
         if (!Array.isArray(records) || records.length === 0) {
             return res.status(400).json(
                 generateResponse(false, "Records array is required", 400, null)
@@ -449,6 +454,22 @@ export async function updateDqrRating(req: any, res: any) {
         }
 
         const updated_by = req.user_id || "system";
+
+        // V3 questionnaire ratings (qv8/qv10/...) upsert into dqr_v3_rating and
+        // advance the workflow once every emission line is rated.
+        if (type && isV3DqrType(type)) {
+            const v3Result = await updateV3DqrRating(type, records, updated_by);
+            return res.status(200).json(
+                generateResponse(true, "DQR rating updated successfully", 200, v3Result)
+            );
+        }
+
+        if (!type || !DQR_CONFIG[type]) {
+            return res.status(400).json(
+                generateResponse(false, "Invalid DQR type", 400, Object.keys(DQR_CONFIG))
+            );
+        }
+
         const result = await updateDqrRatingService(type, records, updated_by);
 
         return res.status(200).json(

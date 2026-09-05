@@ -222,7 +222,6 @@ export async function createTask(req: any, res: any) {
                 supplierEmailMap.set(row.sup_id, row.supplier_email);
             });
 
-            console.log("📧 Assigned Supplier Emails:", supplierEmailMap);
 
             /* FETCH BOM DATA USING bom_pcf_id */
             const bomQuery = `
@@ -422,7 +421,6 @@ export async function getTaskList(req: any, res: any) {
                 filters.push(`c.name = $${idx++}`);
                 values.push(category);
             }
-            console.log(assignee, "ppppppp");
 
 
             if (assignee) {
@@ -806,7 +804,7 @@ export async function sampleEmailTest(req: any, res: any) {
         const bom_pcf_id = '123nbb';
         const supplier_id = '65lko';
 
-        const link = `https://enviguide.nextechltd.in/supplier-questionnaire?bom_pcf_id=${bom_pcf_id}&sup_id=${supplier_id}`;
+        const link = `${process.env.FRONTEND_URL || "https://enviraan.com"}/supplier-questionnaire?bom_pcf_id=${bom_pcf_id}&sup_id=${supplier_id}`;
 
         const html = `
 <!DOCTYPE html>

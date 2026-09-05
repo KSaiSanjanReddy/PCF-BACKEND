@@ -1,39 +1,150 @@
 import { withClient } from "../util/database.js";
-import { matchEmissionFactor, type SupplierEfInput } from "../services/efMatchingService.js";
-import { resolveComposition } from "../services/alloyCompositionService.js";
 
-// 11 columns of the BAFU 2025 Version 2 (Reversioned) CSV with EF ID, exact header names.
-// ef_id now comes from the CSV (authoritative); source_db is constant.
-const CSV_HEADERS = [
-    "EF ID",
-    "Product",
-    "Category",
-    "Process",
-    "Sub-category 2",
-    "Country Code",
-    "Country Name",
-    "Time Period",
-    "Unit",
-    "GWP 100 [kg CO2 eq]",
-    "Embedded Text Logic",
-] as const;
-
-const DB_COLUMNS = [
-    "ef_id",
-    "product",
+// The unified BAFU 2025 emission_factors table is loaded from a clubbed CSV
+// with the 7 source columns (Category, Sub-category, Group, Specific Type,
+// Geography, Unit, GWP 100). Domain is optional — when omitted every row is
+// stamped with DEFAULT_DOMAIN so any row count can import. `ef_id` is
+// BIGSERIAL (auto); `is_legacy`, `search_text`, `source_db` are
+// derived/defaulted server-side. Header matching is tolerant (see mapHeaders):
+// case/spacing/punctuation are normalized, so "Sub-category", "Sub Category",
+// "GWP 100 [kg CO2e]" and the cp1252-mangled "GWP 100 [kg CO?e]" all resolve.
+//
+// Canonical field -> the DB column it fills.
+const FIELDS = [
+    "domain",
     "category",
-    "sub_category_1",
-    "sub_category_2",
-    "country_code",
-    "country_name",
-    "reference_year",
+    "sub_category",
+    "group_name",
+    "specific_type",
+    "geography",
     "unit",
-    "kgco2e_per_unit",
-    "source_db",
-    "embedding_text",
+    "gwp_100",
+] as const;
+type FieldKey = (typeof FIELDS)[number];
+
+// DB columns we INSERT (in this order). ef_id/source_db/created_at/updated_at
+// are handled by the table defaults.
+const DB_COLUMNS = [
+    "domain",
+    "category",
+    "sub_category",
+    "group_name",
+    "specific_type",
+    "geography",
+    "unit",
+    "gwp_100",
+    "is_legacy",
+    "search_text",
 ];
 
-const SOURCE_DB_VALUE = "BAFU:2025";
+// Used when the CSV has no Domain column (normal clubbed-file import).
+const DEFAULT_DOMAIN = "general";
+
+const ALLOWED_DOMAINS = new Set([
+    "material",
+    "manufacturing",
+    "packaging",
+    "transport",
+    "waste",
+    "general",
+]);
+
+// Normalize a header cell for tolerant matching: lowercase, strip everything
+// that isn't a-z/0-9. "Sub-category" -> "subcategory", "GWP 100 [kg CO2e]" ->
+// "gwp100kgco2e", mangled "GWP 100 [kg CO?e]" -> "gwp100kgcoe".
+function normHeader(h: string): string {
+    return (h || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// Map normalized header -> canonical field. gwp is matched by prefix below.
+// Both the human labels ("Group", "Sub-category") and the raw DB column names
+// ("group_name", "sub_category") are accepted — normHeader strips punctuation,
+// so "group_name" -> "groupname" and "sub_category" -> "subcategory".
+const HEADER_TO_FIELD: Record<string, FieldKey> = {
+    domain: "domain",
+    category: "category",
+    subcategory: "sub_category",
+    subcategoryname: "sub_category",
+    group: "group_name",
+    groupname: "group_name",
+    specifictype: "specific_type",
+    specifictypename: "specific_type",
+    geography: "geography",
+    country: "geography",
+    unit: "unit",
+};
+
+// Resolve each CSV header to a field, returning the field->columnIndex map.
+// `Domain` is OPTIONAL — when absent, every row gets DEFAULT_DOMAIN. The other
+// 7 fields are required; missing ones are reported back to the caller.
+function mapHeaders(header: string[]): {
+    map: Partial<Record<FieldKey, number>> | null;
+    missing: FieldKey[];
+    hasDomain: boolean;
+} {
+    const map: Partial<Record<FieldKey, number>> = {};
+    header.forEach((h, idx) => {
+        const n = normHeader(h);
+        if (n.startsWith("gwp")) { map["gwp_100"] = idx; return; }
+        const field = HEADER_TO_FIELD[n];
+        if (field && map[field] === undefined) map[field] = idx;
+    });
+    const required = FIELDS.filter((f) => f !== "domain");
+    const missing = required.filter((f) => map[f] === undefined);
+    return { map: missing.length ? null : map, missing, hasDomain: map["domain"] !== undefined };
+}
+
+// is_legacy is derived (matches the seed's rule): the EF name (specific_type)
+// starts with xx/xxx, carries a [Legacy] tag, or the category mentions
+// Legacy/Avoid. (Formerly keyed on dataset_name, which no longer exists.)
+function deriveIsLegacy(specificType: string | null, category: string | null): boolean {
+    const st = (specificType || "").trim().toLowerCase();
+    const cat = (category || "").toLowerCase();
+    if (/^xx/.test(st)) return true;
+    if (st.includes("[legacy]") || st.includes("legacy")) return true;
+    if (cat.includes("legacy") || cat.includes("avoid")) return true;
+    return false;
+}
+
+// search_text mirrors the seed format: specific_type | category.
+function buildSearchText(specificType: string | null, category: string | null): string {
+    return [specificType, category].filter((s) => !!s && s.trim() !== "").join(" | ");
+}
+
+// Windows-1252 (CP1252) high-range bytes 0x80–0x9F that differ from Latin-1 —
+// smart quotes, en/em dashes, ellipsis, etc. Excel's default "CSV" export uses
+// this encoding, which is why an en-dash (byte 0x96) shows up as � when the
+// file is wrongly read as UTF-8.
+const CP1252_EXTRA: Record<number, number> = {
+    0x80: 0x20ac, 0x82: 0x201a, 0x83: 0x0192, 0x84: 0x201e, 0x85: 0x2026,
+    0x86: 0x2020, 0x87: 0x2021, 0x88: 0x02c6, 0x89: 0x2030, 0x8a: 0x0160,
+    0x8b: 0x2039, 0x8c: 0x0152, 0x8e: 0x017d, 0x91: 0x2018, 0x92: 0x2019,
+    0x93: 0x201c, 0x94: 0x201d, 0x95: 0x2022, 0x96: 0x2013, 0x97: 0x2014,
+    0x98: 0x02dc, 0x99: 0x2122, 0x9a: 0x0161, 0x9b: 0x203a, 0x9c: 0x0153,
+    0x9e: 0x017e, 0x9f: 0x0178,
+};
+
+function decodeCp1252(buf: Buffer): string {
+    let out = "";
+    for (const b of buf) {
+        const mapped = b >= 0x80 && b <= 0x9f ? CP1252_EXTRA[b] : undefined;
+        out += String.fromCharCode(mapped ?? b); // else Latin-1 byte == codepoint
+    }
+    return out;
+}
+
+// Decode the uploaded buffer, tolerating both UTF-8 and Windows-1252 (Excel's
+// default). UTF-8 BOM → UTF-8; otherwise try UTF-8 and, if it produced the
+// replacement char � (invalid sequence), fall back to Windows-1252 so dashes
+// and quotes survive instead of turning into �.
+function decodeBuffer(buf: Buffer): string {
+    if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+        return buf.toString("utf8");
+    }
+    const asUtf8 = buf.toString("utf8");
+    if (!asUtf8.includes("�")) return asUtf8;
+    return decodeCp1252(buf);
+}
 
 // Minimal RFC-4180 CSV parser. Handles "quoted, fields" and "" escaped quotes.
 function parseCsv(text: string): string[][] {
@@ -97,35 +208,42 @@ function parseLocaleNumber(raw: string | undefined): number {
 
 function validateRow(
     cells: string[],
-    rowIndex: number
+    rowIndex: number,
+    map: Partial<Record<FieldKey, number>>,
+    domainOverride?: string | null
 ): { errors: ValidationError[]; values: any[] | null } {
     const errors: ValidationError[] = [];
+    const get = (f: FieldKey): string => {
+        const idx = map[f];
+        return idx === undefined ? "" : (cells[idx] ?? "").trim();
+    };
 
-    if (cells.length !== CSV_HEADERS.length) {
+    // Domain from column when present, else DEFAULT_DOMAIN (clubbed file, any size).
+    const domain = (domainOverride ?? (get("domain") || DEFAULT_DOMAIN)).toLowerCase();
+    if (!ALLOWED_DOMAINS.has(domain)) {
         errors.push({
             row: rowIndex,
-            field: "(row)",
-            message: `expected ${CSV_HEADERS.length} columns, got ${cells.length}`,
+            field: "Domain",
+            message: `invalid "${domain}" (expected material/manufacturing/packaging/transport/waste/general)`,
         });
-        return { errors, values: null };
     }
 
-    // ef_id from CSV (authoritative); fall back to deterministic row-based id if blank.
-    const efId = cells[0]?.trim() || `EF_${String(rowIndex - 1).padStart(5, "0")}`;
+    const category = get("category");
+    if (!category) errors.push({ row: rowIndex, field: "Category", message: "required" });
 
-    const product = cells[1]?.trim();
-    if (!product) errors.push({ row: rowIndex, field: "Product", message: "required" });
+    const specificType = get("specific_type");
+    if (!specificType) errors.push({ row: rowIndex, field: "Specific Type", message: "required" });
 
-    const kgco2eRaw = cells[9]?.trim();
-    const kgco2e = parseLocaleNumber(kgco2eRaw);
-    if (!Number.isFinite(kgco2e)) {
-        errors.push({ row: rowIndex, field: "GWP 100 [kg CO2 eq]", message: `not a number: "${kgco2eRaw}"` });
-    }
+    const geography = get("geography");
+    if (!geography) errors.push({ row: rowIndex, field: "Geography", message: "required" });
 
-    const yearRaw = cells[7]?.trim();
-    const year = parseLocaleNumber(yearRaw);
-    if (!Number.isInteger(year) || year < 1900 || year > 2100) {
-        errors.push({ row: rowIndex, field: "Time Period", message: `not a valid year: "${yearRaw}"` });
+    const unit = get("unit");
+    if (!unit) errors.push({ row: rowIndex, field: "Unit", message: "required" });
+
+    const gwpRaw = get("gwp_100");
+    const gwp = parseLocaleNumber(gwpRaw);
+    if (!Number.isFinite(gwp)) {
+        errors.push({ row: rowIndex, field: "GWP 100", message: `not a number: "${gwpRaw}"` });
     }
 
     if (errors.length > 0) return { errors, values: null };
@@ -133,18 +251,16 @@ function validateRow(
     return {
         errors: [],
         values: [
-            efId,
-            product,
-            cells[2]?.trim() || null,
-            cells[3]?.trim() || null,
-            cells[4]?.trim() || null,
-            cells[5]?.trim() || null,
-            cells[6]?.trim() || null,
-            year,
-            cells[8]?.trim() || null,
-            kgco2e,
-            SOURCE_DB_VALUE,
-            cells[10]?.trim() || null,
+            domain,
+            category,
+            get("sub_category") || null,
+            get("group_name") || null,
+            specificType,
+            geography,
+            unit,
+            gwp,
+            deriveIsLegacy(specificType, category),
+            buildSearchText(specificType, category),
         ],
     };
 }
@@ -161,46 +277,39 @@ export async function importEmissionFactorsCsv(req: any, res: any) {
             return res.status(400).send({ success: false, message: "no file uploaded (field name must be 'file')" });
         }
 
-        const text = req.file.buffer.toString("utf8");
+        const text = decodeBuffer(req.file.buffer);
         const rows = parseCsv(text);
         if (rows.length === 0) {
             return res.status(400).send({ success: false, message: "CSV is empty" });
         }
 
         const header = rows[0].map((h) => h.trim());
-        const mismatches: string[] = [];
-        for (let i = 0; i < CSV_HEADERS.length; i++) {
-            if (header[i] !== CSV_HEADERS[i]) {
-                mismatches.push(`col ${i + 1}: expected "${CSV_HEADERS[i]}", got "${header[i] ?? "(missing)"}"`);
-            }
-        }
-        if (mismatches.length > 0 || header.length !== CSV_HEADERS.length) {
+        const { map, missing, hasDomain } = mapHeaders(header);
+        if (!map) {
             return res.status(400).send({
                 success: false,
-                message: "CSV header does not match expected schema",
-                expected: CSV_HEADERS,
+                message: `CSV is missing required column(s): ${missing.join(", ")}`,
+                expected: FIELDS.filter((f) => f !== "domain"),
                 received: header,
-                mismatches,
+                mismatches: missing.map((f) => `missing column for field "${f}"`),
             });
         }
 
         const dataRows = rows.slice(1);
+
         const allErrors: ValidationError[] = [];
         const allValues: any[][] = [];
-        const seenIds = new Set<string>();
         for (let i = 0; i < dataRows.length; i++) {
             const rowNum = i + 2; // CSV row number (1-based, header is row 1)
-            const result = validateRow(dataRows[i], rowNum);
+            // Skip fully-blank lines (trailing newline at end of file etc.).
+            if (dataRows[i].every((c) => (c ?? "").trim() === "")) continue;
+            // No Domain column → stamp DEFAULT_DOMAIN so any row count imports.
+            const domainOverride = hasDomain ? undefined : DEFAULT_DOMAIN;
+            const result = validateRow(dataRows[i], rowNum, map, domainOverride);
             if (result.errors.length > 0) {
                 allErrors.push(...result.errors);
             } else if (result.values) {
-                const efId = result.values[0] as string;
-                if (seenIds.has(efId)) {
-                    allErrors.push({ row: rowNum, field: "EF_ID", message: `duplicate ID "${efId}"` });
-                } else {
-                    seenIds.add(efId);
-                    allValues.push(result.values);
-                }
+                allValues.push(result.values);
             }
             if (allErrors.length >= 200) {
                 return res.status(400).send({
@@ -223,11 +332,14 @@ export async function importEmissionFactorsCsv(req: any, res: any) {
             return res.status(400).send({ success: false, message: "CSV contained no data rows" });
         }
 
-        // Atomic replace: wipe + bulk insert in one transaction.
-        const insertedCount = await withClient(async (client: any) => {
+        // Atomic replace: wipe + bulk insert in one transaction. Every source
+        // row is inserted verbatim — NO dedup — so the row count always matches
+        // the file exactly (ef_id is auto-assigned, so identical rows are fine).
+        let insertedCount = 0;
+        await withClient(async (client: any) => {
             await client.query("BEGIN");
             try {
-                await client.query("TRUNCATE TABLE emission_factors");
+                await client.query("TRUNCATE TABLE emission_factors RESTART IDENTITY");
 
                 const BATCH_SIZE = 500;
                 for (let start = 0; start < allValues.length; start += BATCH_SIZE) {
@@ -244,20 +356,24 @@ export async function importEmissionFactorsCsv(req: any, res: any) {
                         INSERT INTO emission_factors (${DB_COLUMNS.join(",")})
                         VALUES ${placeholders.join(",")}
                     `;
-                    await client.query(sql, params);
+                    const r = await client.query(sql, params);
+                    insertedCount += r.rowCount ?? 0;
                 }
                 await client.query("COMMIT");
-                return allValues.length;
             } catch (err) {
                 await client.query("ROLLBACK");
                 throw err;
             }
         });
 
+        const skipped = allValues.length - insertedCount;
         return res.status(200).send({
             success: true,
-            message: `Imported ${insertedCount} emission factors`,
+            message:
+                `Imported ${insertedCount.toLocaleString()} emission factor row(s)` +
+                (skipped > 0 ? ` (${skipped} duplicate row(s) skipped)` : ""),
             insertedCount,
+            totalRows: insertedCount,
         });
     } catch (err: any) {
         console.error("importEmissionFactorsCsv error:", err);
@@ -273,33 +389,48 @@ export async function listEmissionFactors(req: any, res: any) {
             const offset = (page - 1) * limit;
 
             const search = String(req.query.search || "").trim();
-            const countryCode = String(req.query.country_code || "").trim();
-            const unit = String(req.query.unit || "").trim();
+            // `country_code` filter maps onto the unified `geography` column;
+            // `unit_kind` filter maps onto `domain`. Param names kept for the
+            // existing frontend query string.
+            const geography = String(req.query.country_code || "").trim();
+            const domain = String(req.query.unit_kind || req.query.domain || "").trim();
+            const sourceDb = String(req.query.source_db || "").trim();
+            // Cascading taxonomy filters (Category → Sub-category → Group →
+            // Specific Type). Each narrows the result to an exact-match value.
+            const category = String(req.query.category || "").trim();
+            const subCategory = String(req.query.sub_category || "").trim();
+            const group = String(req.query.group || req.query.group_name || "").trim();
+            const specificType = String(req.query.specific_type || "").trim();
 
             const conditions: string[] = [];
             const params: any[] = [];
             let p = 1;
 
             if (search) {
+                // Global search hits every text column so users can filter on any
+                // value they see in the table — material name, dataset, geography,
+                // category, sub-category, unit, source — without picking a field.
                 conditions.push(`(
-                    ef_id              ILIKE $${p} OR
-                    product            ILIKE $${p} OR
-                    category           ILIKE $${p} OR
-                    sub_category_1     ILIKE $${p} OR
-                    sub_category_2     ILIKE $${p} OR
-                    country_code       ILIKE $${p} OR
-                    country_name       ILIKE $${p} OR
-                    unit               ILIKE $${p} OR
-                    source_db          ILIKE $${p} OR
-                    embedding_text     ILIKE $${p} OR
-                    CAST(kgco2e_per_unit AS TEXT) ILIKE $${p} OR
-                    CAST(reference_year AS TEXT)  ILIKE $${p}
+                    domain        ILIKE $${p} OR
+                    category      ILIKE $${p} OR
+                    sub_category  ILIKE $${p} OR
+                    group_name    ILIKE $${p} OR
+                    specific_type ILIKE $${p} OR
+                    geography     ILIKE $${p} OR
+                    unit          ILIKE $${p} OR
+                    source_db     ILIKE $${p} OR
+                    search_text   ILIKE $${p}
                 )`);
                 params.push(`%${search}%`);
                 p++;
             }
-            if (countryCode) { conditions.push(`country_code = $${p++}`); params.push(countryCode); }
-            if (unit)        { conditions.push(`unit = $${p++}`); params.push(unit); }
+            if (geography) { conditions.push(`geography = $${p++}`); params.push(geography); }
+            if (domain)    { conditions.push(`domain = $${p++}`); params.push(domain); }
+            if (sourceDb)  { conditions.push(`source_db = $${p++}`); params.push(sourceDb); }
+            if (category)     { conditions.push(`category = $${p++}`); params.push(category); }
+            if (subCategory)  { conditions.push(`sub_category = $${p++}`); params.push(subCategory); }
+            if (group)        { conditions.push(`group_name = $${p++}`); params.push(group); }
+            if (specificType) { conditions.push(`specific_type = $${p++}`); params.push(specificType); }
 
             const whereSql = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -349,106 +480,6 @@ export async function getEmissionFactorById(req: any, res: any) {
     });
 }
 
-// Run the boss's fallback chain against the supplier's input and return the
-// matched EF row plus the full audit trail (every step that was tried).
-export async function postMatchEmissionFactor(req: any, res: any) {
-    try {
-        const body = req.body || {};
-        const input: SupplierEfInput = {
-            category: String(body.category || "").trim(),
-            sub_category_1: body.sub_category_1 ? String(body.sub_category_1).trim() : null,
-            sub_category_2: body.sub_category_2 ? String(body.sub_category_2).trim() : null,
-            country_code: String(body.country_code || "").trim(),
-            country_name: body.country_name ? String(body.country_name).trim() : null,
-            year: Number(body.year),
-            unit: String(body.unit || "").trim(),
-        };
-        if (!input.category) return res.status(400).send({ success: false, message: "category required" });
-        if (!input.country_code) return res.status(400).send({ success: false, message: "country_code required" });
-        if (!Number.isInteger(input.year) || input.year < 1900 || input.year > 2100) {
-            return res.status(400).send({ success: false, message: "year required (4-digit integer)" });
-        }
-        if (!input.unit) return res.status(400).send({ success: false, message: "unit required" });
-
-        const result = await matchEmissionFactor(input);
-        return res.status(200).send({ success: true, data: result });
-    } catch (err: any) {
-        console.error("postMatchEmissionFactor error:", err);
-        return res.status(500).send({ success: false, message: err.message });
-    }
-}
-
-// All distinct (category, sub_category_1, sub_category_2) triples for the
-// 3-layer cascading dropdowns in supplier questionnaire Q6-Q10. Returned shape
-// matches what DynamicQuestionnaireForm's renderer expects (layer1/2/3).
-export async function getEmissionFactorLayerTriples(_req: any, res: any) {
-    return withClient(async (client: any) => {
-        try {
-            const r = await client.query(
-                `SELECT DISTINCT category, sub_category_1, sub_category_2
-                 FROM emission_factors
-                 WHERE category IS NOT NULL AND category <> ''
-                 ORDER BY category, sub_category_1 NULLS FIRST, sub_category_2 NULLS FIRST`
-            );
-            return res.status(200).send({
-                success: true,
-                data: r.rows.map((row: any, idx: number) => ({
-                    id: String(idx),
-                    layer1: row.category,
-                    layer2: row.sub_category_1,
-                    layer3: row.sub_category_2,
-                })),
-            });
-        } catch (err: any) {
-            console.error("getEmissionFactorLayerTriples error:", err);
-            return res.status(500).send({ success: false, message: err.message });
-        }
-    });
-}
-
-export async function getEmissionFactorCountries(_req: any, res: any) {
-    return withClient(async (client: any) => {
-        try {
-            const r = await client.query(
-                `SELECT DISTINCT country_code, country_name
-                 FROM emission_factors
-                 WHERE country_code IS NOT NULL AND country_code <> ''
-                 ORDER BY country_name NULLS LAST, country_code`
-            );
-            return res.status(200).send({
-                success: true,
-                data: r.rows.map((row: any) => ({
-                    country_code: row.country_code,
-                    country_name: row.country_name,
-                })),
-            });
-        } catch (err: any) {
-            console.error("getEmissionFactorCountries error:", err);
-            return res.status(500).send({ success: false, message: err.message });
-        }
-    });
-}
-
-export async function getEmissionFactorUnits(_req: any, res: any) {
-    return withClient(async (client: any) => {
-        try {
-            const r = await client.query(
-                `SELECT DISTINCT unit
-                 FROM emission_factors
-                 WHERE unit IS NOT NULL AND unit <> ''
-                 ORDER BY unit`
-            );
-            return res.status(200).send({
-                success: true,
-                data: r.rows.map((row: any) => row.unit),
-            });
-        } catch (err: any) {
-            console.error("getEmissionFactorUnits error:", err);
-            return res.status(500).send({ success: false, message: err.message });
-        }
-    });
-}
-
 export async function getEmissionFactorStats(_req: any, res: any) {
     return withClient(async (client: any) => {
         try {
@@ -456,9 +487,9 @@ export async function getEmissionFactorStats(_req: any, res: any) {
                 `SELECT
                     COUNT(*)::int                                       AS total,
                     COUNT(DISTINCT source_db)::int                       AS source_db_count,
-                    COUNT(DISTINCT country_code)::int                    AS country_count,
-                    COUNT(DISTINCT unit)::int                            AS unit_count,
-                    MAX(updated_date)                                    AS last_updated
+                    COUNT(DISTINCT geography)::int                       AS country_count,
+                    COUNT(DISTINCT domain)::int                          AS unit_kind_count,
+                    MAX(updated_at)                                      AS last_updated
                  FROM emission_factors`
             );
             return res.status(200).send({ success: true, data: r.rows[0] });
@@ -469,196 +500,75 @@ export async function getEmissionFactorStats(_req: any, res: any) {
     });
 }
 
-// Resolve a material/alloy description (e.g. "lower housing AlSi10Mg(Fe) alloy")
-// into its constituent materials with weight-% ranges + BAFU layer mapping, used
-// to auto-populate the supplier's raw-materials question. Cache-first, then the
-// free LLM layer. Always 200 with a (possibly empty) rows array so the
-// questionnaire degrades gracefully to manual entry when nothing is resolved.
-export async function postMaterialComposition(req: any, res: any) {
-    try {
-        const description = String(req.body?.description || "").trim();
-        if (!description) {
-            return res.status(400).send({ success: false, message: "description required" });
-        }
-        const result = await resolveComposition(description);
-        return res.status(200).send({ success: true, data: result });
-    } catch (err: any) {
-        console.error("postMaterialComposition error:", err);
-        return res.status(500).send({ success: false, message: err.message });
-    }
-}
-
-// Preview the raw-material emissions calculation for a component. Used to verify
-// against the manager's PCF logic sheet. Body:
-//   { component_weight_kg, materials: [{ material, composition_percent }] }
-export async function postRawMaterialsPreview(req: any, res: any) {
-    try {
-        const body = req.body || {};
-        const weight = Number(body.component_weight_kg);
-        if (!Number.isFinite(weight) || weight <= 0) {
-            return res.status(400).send({ success: false, message: "component_weight_kg required (> 0)" });
-        }
-        const materials = Array.isArray(body.materials) ? body.materials : [];
-        if (materials.length === 0) {
-            return res.status(400).send({ success: false, message: "materials[] required" });
-        }
-        const { calculateRawMaterials } = await import("../services/materialEfService.js");
-        const result = await calculateRawMaterials(weight, materials);
-        return res.status(200).send({ success: true, data: result });
-    } catch (err: any) {
-        console.error("postRawMaterialsPreview error:", err);
-        return res.status(500).send({ success: false, message: err.message });
-    }
-}
-
-// Preview the production/electricity emission for a component. Body:
-//   { component_weight_kg, factory_weight_kg, factory_energy_kwh, electricity_ef }
-// electricity_ef defaults to the BAFU electricity factor used in the sheet (0.9).
-export async function postProductionPreview(req: any, res: any) {
-    try {
-        const b = req.body || {};
-        const componentWeight = Number(b.component_weight_kg);
-        const factoryWeight = Number(b.factory_weight_kg);
-        const factoryEnergy = Number(b.factory_energy_kwh);
-        const ef = b.electricity_ef != null ? Number(b.electricity_ef) : 0.9;
-        if (!Number.isFinite(componentWeight) || componentWeight <= 0) {
-            return res.status(400).send({ success: false, message: "component_weight_kg required (> 0)" });
-        }
-        if (!Number.isFinite(factoryWeight) || factoryWeight <= 0) {
-            return res.status(400).send({ success: false, message: "factory_weight_kg required (> 0)" });
-        }
-        if (!Number.isFinite(factoryEnergy) || factoryEnergy < 0) {
-            return res.status(400).send({ success: false, message: "factory_energy_kwh required" });
-        }
-        const { calculateProductionEmission } = await import("../services/productionEmissionService.js");
-        const result = calculateProductionEmission(componentWeight, factoryWeight, factoryEnergy, ef);
-        return res.status(200).send({ success: true, data: result });
-    } catch (err: any) {
-        console.error("postProductionPreview error:", err);
-        return res.status(500).send({ success: false, message: err.message });
-    }
-}
-
-// Preview packaging emission for one packaging type. Body:
-//   { packaging_weight_kg, packaging_type }
-// emission = packaging_weight × EF (highest EF for the mapped BAFU product).
-export async function postPackagingPreview(req: any, res: any) {
-    try {
-        const b = req.body || {};
-        const weight = Number(b.packaging_weight_kg);
-        const type = String(b.packaging_type || "").trim();
-        if (!Number.isFinite(weight) || weight < 0) {
-            return res.status(400).send({ success: false, message: "packaging_weight_kg required" });
-        }
-        if (!type) {
-            return res.status(400).send({ success: false, message: "packaging_type required" });
-        }
-        const { matchMaterialEf } = await import("../services/materialEfService.js");
-        const ef = await matchMaterialEf(type);
-        const emission = ef.matched && ef.ef != null ? Number((weight * ef.ef).toFixed(6)) : 0;
-        return res.status(200).send({
-            success: true,
-            data: {
-                packaging_type: type,
-                packaging_weight_kg: weight,
-                matched: ef.matched,
-                ef: ef.ef,
-                ef_id: ef.ef_id,
-                ef_product: ef.product,
-                ef_country: ef.country_code,
-                packaging_emission: emission,
-            },
-        });
-    } catch (err: any) {
-        console.error("postPackagingPreview error:", err);
-        return res.status(500).send({ success: false, message: err.message });
-    }
-}
-
-// Distinct packaging types for the Q8 "Packaging Type" dropdown. Public (the
-// supplier questionnaire is unauthenticated). Each type maps to a BAFU product.
-export async function getPackagingTypes(_req: any, res: any) {
+// Cascading taxonomy for the supplier-questionnaire EF dropdowns:
+//   level=category                          → distinct categories
+//   level=sub_category  (+category)         → distinct sub-categories in it
+//   level=group         (+category,+sub)    → distinct group_name
+//   level=specific_type (+category,+sub,+group) → distinct specific type names
+//                                                (geography/GWP chosen next)
+// Optional ?q= filters by ILIKE substring. Returns up to 50, sorted. The 4
+// levels together identify exactly one EF row.
+export async function getEfTaxonomy(req: any, res: any) {
     return withClient(async (client: any) => {
         try {
+            const level = String(req.query.level || "category").trim();
+            const q = String(req.query.q || "").trim();
+            const category = String(req.query.category || "").trim();
+            const subCategory = String(req.query.sub_category || "").trim();
+            const group = String(req.query.group || "").trim();
+            const specificType = String(req.query.specific_type || "").trim();
+
+            // Include EF=0 rows: a zero emission factor is valid real data (many
+            // legitimate waste/recycling treatments are ~0). Only require the EF
+            // to be present, so the supplier can pick the exact DB row.
+            const conds: string[] = ["gwp_100 IS NOT NULL"];
+            const params: any[] = [];
+            let p = 1;
+            const addParentEq = (col: string, val: string) => {
+                if (val) { conds.push(`${col} = $${p++}`); params.push(val); }
+            };
+
+            const col =
+                level === "category" ? "category" :
+                level === "sub_category" ? "sub_category" :
+                level === "group" ? "group_name" :
+                level === "specific_type" ? "specific_type" :
+                level === "geography" ? "geography" : "";
+            if (!col) return res.status(400).send({ success: false, message: `invalid level: ${level}` });
+
+            // Cascade parents: each level is filtered by every level above it.
+            // geography is the 5th/last level (Electricity Q10) — filtered by all 4.
+            if (level !== "category") addParentEq("category", category);
+            if (level === "group" || level === "specific_type" || level === "geography") addParentEq("sub_category", subCategory);
+            if (level === "specific_type" || level === "geography") addParentEq("group_name", group);
+            if (level === "geography") addParentEq("specific_type", specificType);
+
+            if (q) { conds.push(`${col} ILIKE $${p++}`); params.push(`%${q}%`); }
+            const where = `WHERE ${conds.join(" AND ")} AND ${col} IS NOT NULL AND ${col} <> ''`;
+
+            if (level === "specific_type") {
+                // Distinct type names only — geography (and GWP) vary per country
+                // and are chosen in the next cascade step, so returning every EF
+                // row here produced duplicate labels like many "At the grid".
+                const r = await client.query(
+                    `SELECT DISTINCT specific_type
+                       FROM emission_factors ${where}
+                      ORDER BY specific_type LIMIT 500`,
+                    params
+                );
+                return res.status(200).send({
+                    success: true,
+                    data: r.rows.map((x: any) => ({ specific_type: x.specific_type })),
+                });
+            }
             const r = await client.query(
-                `SELECT material_key AS id, material_label AS name
-                 FROM material_ef_mapping
-                 WHERE kind = 'packaging'
-                 ORDER BY material_label`
+                `SELECT DISTINCT ${col} AS value FROM emission_factors ${where} ORDER BY ${col} LIMIT 1000`,
+                params
             );
-            return res.status(200).send({ success: true, data: r.rows });
+            return res.status(200).send({ success: true, data: r.rows.map((x: any) => x.value) });
         } catch (err: any) {
-            console.error("getPackagingTypes error:", err);
+            console.error("getEfTaxonomy error:", err);
             return res.status(500).send({ success: false, message: err.message });
         }
     });
-}
-
-// Preview transport emission. Body:
-//   { transported_weight, weight_unit, legs: [{ mode, distance_km }] }
-export async function postTransportPreview(req: any, res: any) {
-    try {
-        const b = req.body || {};
-        const weight = Number(b.transported_weight);
-        const unit = String(b.weight_unit || "kg").trim();
-        const legs = Array.isArray(b.legs) ? b.legs : [];
-        if (!Number.isFinite(weight) || weight < 0) {
-            return res.status(400).send({ success: false, message: "transported_weight required" });
-        }
-        if (legs.length === 0) {
-            return res.status(400).send({ success: false, message: "legs[] required" });
-        }
-        const { calculateTransport } = await import("../services/transportEmissionService.js");
-        const result = await calculateTransport(weight, unit, legs);
-        return res.status(200).send({ success: true, data: result });
-    } catch (err: any) {
-        console.error("postTransportPreview error:", err);
-        return res.status(500).send({ success: false, message: err.message });
-    }
-}
-
-// Preview waste emission. Body:
-//   { dominant_material, production_waste_weight_kg, packaging_type, packaging_waste_weight_kg }
-export async function postWastePreview(req: any, res: any) {
-    try {
-        const b = req.body || {};
-        const dominantMaterial = String(b.dominant_material || "").trim();
-        const packagingType = String(b.packaging_type || "").trim();
-        const prodW = Number(b.production_waste_weight_kg);
-        const packW = Number(b.packaging_waste_weight_kg);
-        if (!Number.isFinite(prodW) || !Number.isFinite(packW)) {
-            return res.status(400).send({ success: false, message: "production/packaging waste weights required" });
-        }
-        const { calculateWaste } = await import("../services/wasteEmissionService.js");
-        const result = await calculateWaste(dominantMaterial, prodW, packagingType, packW);
-        return res.status(200).send({ success: true, data: result });
-    } catch (err: any) {
-        console.error("postWastePreview error:", err);
-        return res.status(500).send({ success: false, message: err.message });
-    }
-}
-
-// Run the full PCF calculation (all 5 sections) for a structured payload.
-export async function postPcfCalculate(req: any, res: any) {
-    try {
-        const { calculatePcf } = await import("../services/pcfCalculationService.js");
-        const result = await calculatePcf(req.body || {});
-        return res.status(200).send({ success: true, data: result });
-    } catch (err: any) {
-        console.error("postPcfCalculate error:", err);
-        return res.status(500).send({ success: false, message: err.message });
-    }
-}
-
-// Run the full PCF from the raw supplier-questionnaire data object.
-export async function postPcfFromQuestionnaire(req: any, res: any) {
-    try {
-        const { extractPcfInput, calculatePcf } = await import("../services/pcfCalculationService.js");
-        const input = extractPcfInput(req.body || {});
-        const result = await calculatePcf(input);
-        return res.status(200).send({ success: true, data: { input, result } });
-    } catch (err: any) {
-        console.error("postPcfFromQuestionnaire error:", err);
-        return res.status(500).send({ success: false, message: err.message });
-    }
 }

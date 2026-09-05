@@ -1,3 +1,4 @@
+import jwt from "jsonwebtoken";
 import { sendMail } from "../util/mailTransporter.js";
 
 export async function sendSupplierTaskEmail(payload: {
@@ -8,10 +9,26 @@ export async function sendSupplierTaskEmail(payload: {
 }) {
 
     const subject = 'Supplier Questionnaire Request'
+    // Magic-link token: suppliers have no login account, so we sign a token for
+    // the recipient's email and bake it into the link. When they open it, the
+    // frontend sends this token and authService.authenticate resolves them via
+    // findSupplier(email) — no login needed. Valid for 60 days.
+    const supplierEmail = Array.isArray(payload.email) ? (payload.email as any)[0] : payload.email;
+    const TOKEN_SECRET = process.env.TOKEN_SECRET ?? "defaultSecret";
+    // Bake the sup_id + an explicit `type: "supplier"` marker into the token so
+    // authenticate resolves the recipient AS this supplier directly — even if
+    // their email also exists as a platform account (client/manufacturer), which
+    // would otherwise be matched first and reject the questionnaire save.
+    const token = jwt.sign(
+        { email: supplierEmail, sup_id: payload.supplier_id, type: "supplier" },
+        TOKEN_SECRET,
+        { expiresIn: "60d" }
+    );
     const link =
-        `https://enviguide.nextechltd.in/supplier-questionnaire` +
+        `${process.env.FRONTEND_URL || "https://enviraan.com"}/supplier-questionnaire` +
         `?bom_pcf_id=${payload.bom_pcf_id}` +
-        `&sup_id=${payload.supplier_id}`;
+        `&sup_id=${payload.supplier_id}` +
+        `&token=${encodeURIComponent(token)}`;
 
     const html = `
 <!DOCTYPE html>

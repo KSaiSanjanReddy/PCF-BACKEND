@@ -807,16 +807,7 @@ async function bulkInsert(client: any, tableName: string, columns: string[], row
         VALUES ${placeholders.join(', ')}
     `;
 
-        // ✅ ADD DETAILED LOGGING
-        console.log(`📊 Bulk Insert into ${tableName}:`, {
-            columns,
-            rowCount: rows.length,
-            sampleRow: rows[0],
-            query: query.substring(0, 200) + '...',
-        });
-
         await client.query(query, values);
-        console.log(`✅ Successfully inserted ${rows.length} rows into ${tableName}`);
     } catch (error: any) {
         // ✅ LOG THE ACTUAL ERROR DETAILS
         console.error(`❌ BULK INSERT FAILED for table: ${tableName}`);
@@ -1003,7 +994,6 @@ export async function addSupplierSustainabilityData(req: any, res: any) {
                 [bom_pcf_id, sup_id]
             );
 
-            console.log(`Creating ${allDQRConfigs.length} DQR table entries...`);
             await createDQRRecords(client, allDQRConfigs);
 
             await client.query("COMMIT");
@@ -1567,7 +1557,6 @@ async function insertSupplierProduct(client: any, data: any, sgiq_id: string) {
     }
 
     /* ---------------- DQR Final Insert ---------------- */
-    console.log(`Creating ${allDQRConfigs.length} DQR table entries...`);
     await createDQRRecords(client, allDQRConfigs);
 }
 
@@ -1805,7 +1794,6 @@ async function insertScopeOne(client: any, data: any, sgiq_id: string) {
 
     await Promise.all(childInserts);
 
-    console.log(`Creating ${allDQRConfigs.length} DQR table entries...`);
     await createDQRRecords(client, allDQRConfigs);
 }
 
@@ -2015,7 +2003,6 @@ async function insertScopeTwo(client: any, data: any, sgiq_id: string, annual_re
     const childInserts = [];
 
     if (Array.isArray(data.scope_two_indirect_emissions_from_purchased_energy_questions)) {
-        console.log(data.sup_id, "data.sup_iddata.sup_id");
 
         // data.scope_two_indirect_emissions_from_purchased_energy_questions = data.sup_id;
 
@@ -2685,7 +2672,6 @@ async function insertScopeTwo(client: any, data: any, sgiq_id: string, annual_re
 
     await Promise.all(childInserts);
 
-    console.log(`Creating ${allDQRConfigs.length} DQR table entries...`);
     await createDQRRecords(client, allDQRConfigs);
 }
 
@@ -3499,7 +3485,6 @@ async function insertScopeThree(client: any, data: any, sgiq_id: string, annual_
     }
 
     await Promise.all(childInserts);
-    console.log(`Creating ${allDQRConfigs.length} DQR table entries...`);
     await createDQRRecords(client, allDQRConfigs);
 }
 

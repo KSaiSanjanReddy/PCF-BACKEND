@@ -259,24 +259,14 @@ export async function resolveComposition(description: string): Promise<Compositi
     if (!key) return { alloy: null, rows: [], source: "none" };
 
     return withClient(async (client: any) => {
-        // 1. Cache.
+        // CACHE-ONLY. Q7 auto-populate is intentionally limited to alloys we have
+        // pre-seeded in `alloy_composition_cache` (the known demo/test cases). Any
+        // other description returns nothing so the supplier fills the materials
+        // manually — this keeps auto-fill deterministic, avoids surprise/invented
+        // compositions, and removes the live-LLM (Gemini) dependency entirely.
         const cached = await lookupCache(client, key);
         if (cached) return cached;
 
-        // 2. Free LLM layer.
-        const vocab = await getBafuVocabulary(client);
-        const extracted = await llmExtract(description, vocab);
-        if (!extracted) return { alloy: designation, rows: [], source: "none" };
-
-        // Cache under the looked-up key, and under the canonical alloy key too
-        // (so future descriptions naming the same alloy hit immediately).
-        await storeCache(client, key, extracted.alloy || designation, extracted.rows, extracted.source);
-        if (extracted.alloy) {
-            const canonicalKey = normalizeAlloyKey(extracted.alloy);
-            if (canonicalKey && canonicalKey !== key) {
-                await storeCache(client, canonicalKey, extracted.alloy, extracted.rows, extracted.source);
-            }
-        }
-        return { alloy: extracted.alloy || designation, rows: extracted.rows, source: extracted.source };
+        return { alloy: designation, rows: [], source: "none" };
     });
 }

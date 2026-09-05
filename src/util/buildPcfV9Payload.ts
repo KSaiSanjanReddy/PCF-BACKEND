@@ -78,6 +78,33 @@ export interface EnviraanPcfInput {
     precedingPfIds?: string[];
 
     comment?: string;
+
+    // ---- 28-question pipeline: detailed computed fields ----
+    // When these are present the simple flat *Value fields are ignored for the
+    // corresponding sections. Allows the new formula engine to emit fully-typed
+    // Catena-X v9 values without duplicating JSON shape logic.
+    carbonContentDetail?: {
+        biogenicCarbonContent: number;
+        fossilCarbonContent: number;
+        recycledCarbonContent: number;
+        carbonContentTotal: number;
+        packagingBiogenicCarbonContent: number;
+    };
+    productionStageDetail?: StageEmissionsDetail;
+    packagingStageDetail?: StageEmissionsDetail & { packagingEmissionsIncluded: boolean };
+    distributionStageDetail?: StageEmissionsDetail & { distributionStageIncluded: boolean };
+}
+
+export interface StageEmissionsDetail {
+    fossilGhgEmissions: number;
+    biogenicNonCO2Emissions: number;
+    biogenicCO2Uptake: number;
+    landUseChangeGhgEmissions: number;
+    landManagementBiogenicCO2Emissions: number;
+    landManagementBiogenicCO2Removals: number;
+    aircraftGhgEmissions: number;
+    pcfExcludingBiogenicUptake: number;
+    pcfIncludingBiogenicUptake: number;
 }
 
 export function buildPcfV9Payload(input: EnviraanPcfInput): Record<string, unknown> {
@@ -96,13 +123,21 @@ export function buildPcfV9Payload(input: EnviraanPcfInput): Record<string, unkno
         general: [{ comment: input.comment ?? "" }],
 
         carbonContent: [
-            {
-                biogenicCarbonContent: 0,
-                packagingBiogenicCarbonContent: 0,
-                recycledCarbonContent: 0,
-                carbonContentTotal: input.totalPcfValue,
-                fossilCarbonContent: 0,
-            },
+            input.carbonContentDetail
+                ? {
+                      biogenicCarbonContent: input.carbonContentDetail.biogenicCarbonContent,
+                      packagingBiogenicCarbonContent: input.carbonContentDetail.packagingBiogenicCarbonContent,
+                      recycledCarbonContent: input.carbonContentDetail.recycledCarbonContent,
+                      carbonContentTotal: input.carbonContentDetail.carbonContentTotal,
+                      fossilCarbonContent: input.carbonContentDetail.fossilCarbonContent,
+                  }
+                : {
+                      biogenicCarbonContent: 0,
+                      packagingBiogenicCarbonContent: 0,
+                      recycledCarbonContent: 0,
+                      carbonContentTotal: input.totalPcfValue,
+                      fossilCarbonContent: 0,
+                  },
         ],
 
         attestationOfConformance: input.attestation
@@ -123,47 +158,86 @@ export function buildPcfV9Payload(input: EnviraanPcfInput): Record<string, unkno
         productLifeCycleStagesAndEmissions: [
             {
                 productionStage: [
-                    {
-                        biogenicNonCO2Emissions: 0,
-                        landUseChangeGhgEmissions: 0,
-                        landManagementBiogenicCO2Removals: 0,
-                        aircraftGhgEmissions: 0,
-                        landManagementBiogenicCO2Emissions: 0,
-                        packagingLandManagementBiogenicCO2Emissions: 0,
-                        pcfExcludingBiogenicUptake: productionStageTotal,
-                        fossilGhgEmissions: productionStageTotal,
-                        biogenicCO2Uptake: 0,
-                        pcfIncludingBiogenicUptake: productionStageTotal,
-                    },
+                    input.productionStageDetail
+                        ? {
+                              biogenicNonCO2Emissions: input.productionStageDetail.biogenicNonCO2Emissions,
+                              landUseChangeGhgEmissions: input.productionStageDetail.landUseChangeGhgEmissions,
+                              landManagementBiogenicCO2Removals: input.productionStageDetail.landManagementBiogenicCO2Removals,
+                              aircraftGhgEmissions: input.productionStageDetail.aircraftGhgEmissions,
+                              landManagementBiogenicCO2Emissions: input.productionStageDetail.landManagementBiogenicCO2Emissions,
+                              packagingLandManagementBiogenicCO2Emissions: 0,
+                              pcfExcludingBiogenicUptake: input.productionStageDetail.pcfExcludingBiogenicUptake,
+                              fossilGhgEmissions: input.productionStageDetail.fossilGhgEmissions,
+                              biogenicCO2Uptake: input.productionStageDetail.biogenicCO2Uptake,
+                              pcfIncludingBiogenicUptake: input.productionStageDetail.pcfIncludingBiogenicUptake,
+                          }
+                        : {
+                              biogenicNonCO2Emissions: 0,
+                              landUseChangeGhgEmissions: 0,
+                              landManagementBiogenicCO2Removals: 0,
+                              aircraftGhgEmissions: 0,
+                              landManagementBiogenicCO2Emissions: 0,
+                              packagingLandManagementBiogenicCO2Emissions: 0,
+                              pcfExcludingBiogenicUptake: productionStageTotal,
+                              fossilGhgEmissions: productionStageTotal,
+                              biogenicCO2Uptake: 0,
+                              pcfIncludingBiogenicUptake: productionStageTotal,
+                          },
                 ],
                 packagingStage: [
-                    {
-                        packagingEmissionsIncluded: packagingTotal > 0,
-                        packagingPcfIncludingBiogenicUptake: packagingTotal,
-                        packagingBiogenicNonCO2Emissions: 0,
-                        packagingLandManagementBiogenicCO2Emissions: 0,
-                        packagingFossilGhgEmissions: packagingTotal,
-                        packagingPcfExcludingBiogenicUptake: packagingTotal,
-                        packagingBiogenicCO2Uptake: 0,
-                        packagingLandUseChangeGhgEmissions: 0,
-                        packagingAircraftGhgEmissions: 0,
-                        packagingLandManagementBiogenicCO2Removals: 0,
-                    },
+                    input.packagingStageDetail
+                        ? {
+                              packagingEmissionsIncluded: input.packagingStageDetail.packagingEmissionsIncluded,
+                              packagingPcfIncludingBiogenicUptake: input.packagingStageDetail.pcfIncludingBiogenicUptake,
+                              packagingBiogenicNonCO2Emissions: input.packagingStageDetail.biogenicNonCO2Emissions,
+                              packagingLandManagementBiogenicCO2Emissions: input.packagingStageDetail.landManagementBiogenicCO2Emissions,
+                              packagingFossilGhgEmissions: input.packagingStageDetail.fossilGhgEmissions,
+                              packagingPcfExcludingBiogenicUptake: input.packagingStageDetail.pcfExcludingBiogenicUptake,
+                              packagingBiogenicCO2Uptake: input.packagingStageDetail.biogenicCO2Uptake,
+                              packagingLandUseChangeGhgEmissions: input.packagingStageDetail.landUseChangeGhgEmissions,
+                              packagingAircraftGhgEmissions: input.packagingStageDetail.aircraftGhgEmissions,
+                              packagingLandManagementBiogenicCO2Removals: input.packagingStageDetail.landManagementBiogenicCO2Removals,
+                          }
+                        : {
+                              packagingEmissionsIncluded: packagingTotal > 0,
+                              packagingPcfIncludingBiogenicUptake: packagingTotal,
+                              packagingBiogenicNonCO2Emissions: 0,
+                              packagingLandManagementBiogenicCO2Emissions: 0,
+                              packagingFossilGhgEmissions: packagingTotal,
+                              packagingPcfExcludingBiogenicUptake: packagingTotal,
+                              packagingBiogenicCO2Uptake: 0,
+                              packagingLandUseChangeGhgEmissions: 0,
+                              packagingAircraftGhgEmissions: 0,
+                              packagingLandManagementBiogenicCO2Removals: 0,
+                          },
                 ],
                 distributionStage: [
-                    {
-                        distributionStageIncluded:
-                            input.pcfScope === "Cradle-to-grave" && distributionTotal > 0,
-                        distributionStagePcfIncludingBiogenicUptake: distributionTotal,
-                        distributionStagePcfExcludingBiogenicUptake: distributionTotal,
-                        distributionStageFossilGhgEmissions: distributionTotal,
-                        distributionStageAircraftGhgEmissions: 0,
-                        distributionStageLandUseChangeGhgEmissions: 0,
-                        distributionStageLandManagementBiogenicCO2Emissions: 0,
-                        distributionStageLandManagementBiogenicCO2Removals: 0,
-                        distributionStageBiogenicCO2Uptake: 0,
-                        distributionStageBiogenicNonCO2Emissions: 0,
-                    },
+                    input.distributionStageDetail
+                        ? {
+                              distributionStageIncluded: input.distributionStageDetail.distributionStageIncluded,
+                              distributionStagePcfIncludingBiogenicUptake: input.distributionStageDetail.pcfIncludingBiogenicUptake,
+                              distributionStagePcfExcludingBiogenicUptake: input.distributionStageDetail.pcfExcludingBiogenicUptake,
+                              distributionStageFossilGhgEmissions: input.distributionStageDetail.fossilGhgEmissions,
+                              distributionStageAircraftGhgEmissions: input.distributionStageDetail.aircraftGhgEmissions,
+                              distributionStageLandUseChangeGhgEmissions: input.distributionStageDetail.landUseChangeGhgEmissions,
+                              distributionStageLandManagementBiogenicCO2Emissions: input.distributionStageDetail.landManagementBiogenicCO2Emissions,
+                              distributionStageLandManagementBiogenicCO2Removals: input.distributionStageDetail.landManagementBiogenicCO2Removals,
+                              distributionStageBiogenicCO2Uptake: input.distributionStageDetail.biogenicCO2Uptake,
+                              distributionStageBiogenicNonCO2Emissions: input.distributionStageDetail.biogenicNonCO2Emissions,
+                          }
+                        : {
+                              distributionStageIncluded:
+                                  input.pcfScope === "Cradle-to-grave" && distributionTotal > 0,
+                              distributionStagePcfIncludingBiogenicUptake: distributionTotal,
+                              distributionStagePcfExcludingBiogenicUptake: distributionTotal,
+                              distributionStageFossilGhgEmissions: distributionTotal,
+                              distributionStageAircraftGhgEmissions: 0,
+                              distributionStageLandUseChangeGhgEmissions: 0,
+                              distributionStageLandManagementBiogenicCO2Emissions: 0,
+                              distributionStageLandManagementBiogenicCO2Removals: 0,
+                              distributionStageBiogenicCO2Uptake: 0,
+                              distributionStageBiogenicNonCO2Emissions: 0,
+                          },
                 ],
             },
         ],

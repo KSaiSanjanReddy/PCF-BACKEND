@@ -81,7 +81,7 @@ export async function signup(req: any, res: any) {
                         TOKEN_SECRET,
                         { expiresIn: "24h" }
                     );
-                    const setupLink = `https://enviguide.nextechltd.in/reset-password?token=${token}&setup=1`;
+                    const setupLink = `${process.env.FRONTEND_URL || "https://enviraan.com"}/reset-password?token=${token}&setup=1`;
                     const subject = "Welcome to EnviGuide — Set up your account";
                     const html = `
 <!DOCTYPE html>
@@ -251,6 +251,8 @@ export async function verifyMFA(req: any, res: any) {
     if (!isValid) {
         return res.status(401).json({ success: false, message: "Invalid or expired MFA code" });
     }
+
+    await userService.recordLoginSuccess(findUser.rows[0].user_id);
 
     // Issue final JWT after MFA success
     const jwttoken = generateAccessToken({
@@ -652,6 +654,36 @@ export async function getAllUser(req: any, res: any) {
     }
 }
 
+export async function getActiveLoginMonitoring(req: any, res: any) {
+    try {
+        const getActiveUsers = await userService.getActiveLoginMonitoring(req.query);
+        return res.status(200).send(
+            generateResponse(true, "active users fetched successfully", 200, {
+                totalCount: getActiveUsers.totalRowsCount,
+                userList: getActiveUsers.userList
+            })
+        );
+    } catch (error: any) {
+        return res.status(400).send(generateResponse(false, error.message, 400, null));
+    }
+}
+
+export async function logoutUserSession(req: any, res: any) {
+    try {
+        if (!req.user_id) {
+            return res.status(400).send(generateResponse(false, "user not authenticated", 400, null));
+        }
+
+        await userService.markUserLoggedOut(req.user_id);
+
+        return res.status(200).send(
+            generateResponse(true, "user logged out successfully", 200, null)
+        );
+    } catch (error: any) {
+        return res.status(400).send(generateResponse(false, error.message, 400, null));
+    }
+}
+
 export async function getUserById(req: any, res: any) {
 
     try {
@@ -862,7 +894,7 @@ export async function forgotPassword(req: any, res: any) {
         }
         const token = generateAccessToken({ user_email: findUser.rows[0].user_email });
 
-        const resetLink = `https://enviguide.nextechltd.in/reset-password?token=${token}`;
+        const resetLink = `${process.env.FRONTEND_URL || "https://enviraan.com"}/reset-password?token=${token}`;
         const subject = "Password Reset Request - Enviguide";
 
         const html = `
@@ -1007,7 +1039,7 @@ export async function forgotMFA(req: any, res: any) {
             return res.status(400).send(generateResponse(false, 'User with this email does not exist', 400, null));
         }
         const token = generateAccessTokenForResetPassAndMFA({ user_email: findUser.rows[0].user_email });
-        const resetLink = `https://enviguide.nextechltd.in/reset-mfa?token=${token}`;
+        const resetLink = `${process.env.FRONTEND_URL || "https://enviraan.com"}/reset-mfa?token=${token}`;
         const subject = "Reset Your Enviguide MFA";
 
         const to = req.body.user_email;
